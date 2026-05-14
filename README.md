@@ -1,124 +1,183 @@
 # MAPF Simulator (CBS)
 
-Multi-Agent Path Finding 시뮬레이터.  
-알고리즘: **Conflict-Based Search (CBS)**  
-맵 포맷: **PGM + YAML** (ROS map_server 표준 호환)
+Multi-Agent Path Finding simulator with physical agent bodies.
+
+- **Algorithm**: Conflict-Based Search (CBS) with space-time A*
+- **Map format**: PGM + YAML (ROS map_server compatible)
+- **Collision model**: circular agent body — obstacle clearance + inter-agent distance
 
 ---
 
-## 실행
+## Quick Start
 
 ```bash
 pip install -r requirements.txt
+python make_maps.py   # generate example maps (first time only)
 python main.py
 ```
 
-예시 맵 생성 (최초 1회):
+### CLI options
 
 ```bash
-python make_maps.py
+python main.py --cols 200 --rows 100 --cell 8
 ```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--cols` | 40 | Grid width in cells |
+| `--rows` | 30 | Grid height in cells |
+| `--cell` | 8 | Cell size in pixels (8–40) |
 
 ---
 
-## 프로젝트 구조
+## Project Structure
 
 ```
-MAPF_concept_develop/
-├── main.py           실행 진입점
-├── grid.py           Grid 클래스 + PGM/YAML 로드·저장
-├── astar.py          Space-time A* (CBS 로우레벨 플래너)
-├── cbs.py            CBS 알고리즘 (하이레벨 플래너)
-├── simulator.py      Pygame UI (에디터 + 시뮬레이터 통합)
-├── make_maps.py      예시 맵 생성 스크립트
+MAPF_Simulator/
+├── main.py           Entry point (CLI args)
+├── grid.py           Grid class + PGM/YAML I/O
+├── astar.py          Space-time A* with CBS constraints & clearance
+├── cbs.py            CBS high-level planner (duplicate-free)
+├── simulator.py      Pygame UI — editor + simulator
+├── make_maps.py      Example map generator
 ├── requirements.txt
 └── maps/
-    ├── empty_40x30.pgm / .yaml     빈 40×30 맵
-    ├── warehouse_40x30.pgm / .yaml 창고형 맵
-    └── random_32x24.pgm / .yaml    랜덤 장애물 맵
+    ├── empty_40x30.pgm / .yaml
+    ├── warehouse_40x30.pgm / .yaml
+    ├── warehouse_200x100.pgm / .yaml
+    └── random_32x24.pgm / .yaml
 ```
 
 ---
 
-## PGM + YAML 맵 포맷
+## PGM + YAML Map Format
 
 ```yaml
-# example.yaml
-image: example.pgm      # PGM 파일명 (같은 디렉토리)
-resolution: 0.05        # m/pixel
+image: map.pgm        # PGM filename (same directory)
+resolution: 0.05      # metres/pixel
 origin: [0.0, 0.0, 0.0]
-occupied_thresh: 0.65   # 점유 확률 임계값
-free_thresh: 0.196      # 자유 확률 임계값
+occupied_thresh: 0.65
+free_thresh: 0.196
 negate: 0
 ```
 
-PGM 규칙:  
-- 흰색(255) = 자유 공간  
-- 검은색(0)  = 장애물
+PGM convention: white (255) = free, black (0) = obstacle.
 
 ---
 
-## 조작 방법
+## Controls
 
-### 모드 전환
+### Mode
 
-| 키 | 기능 |
+| Key | Action |
 |---|---|
-| `1` | 장애물 편집 모드 |
-| `2` | 에이전트 편집 모드 |
-| `Esc` | 현재 서브 동작 취소 |
+| `1` | Obstacle edit mode |
+| `2` | Agent edit mode |
+| `Esc` | Cancel current action |
 
-### 장애물 편집 (모드 `1`)
+### Obstacle Edit (mode `1`)
 
-| 조작 | 기능 |
+| Input | Action |
 |---|---|
-| 좌클릭 / 드래그 | 장애물 배치 |
-| 우클릭 / 드래그 | 장애물 제거 |
+| Left-click / drag | Place obstacle |
+| Right-click / drag | Erase obstacle |
 
-### 에이전트 편집 (모드 `2`)
+### Agent Edit (mode `2`)
 
-| 조작 | 기능 |
+| Input | Action |
 |---|---|
-| 사이드바 `+Agent` | 에이전트 추가 (최대 8개) |
-| 사이드바 `-Agent` | 선택된 에이전트 삭제 |
-| `s` 또는 `SetStart` 버튼 후 그리드 클릭 | 시작 지점 설정 |
-| `g` 또는 `SetGoal` 버튼 후 그리드 클릭 | 목표 지점 설정 |
-| `F1` ~ `F8` | 에이전트 선택 |
-| 그리드에서 에이전트 위치 클릭 | 해당 에이전트 선택 |
+| `+Agent` button | Add agent (max 8) |
+| `-Agent` button | Delete selected agent |
+| `s` or `SetStart` → click grid | Set start position |
+| `g` or `SetGoal` → click grid | Set goal position |
+| `F1`–`F8` | Select agent by index |
+| Click agent marker | Select that agent |
 
-### 시뮬레이션
+### Simulation
 
-| 키 / 버튼 | 기능 |
+| Key / Button | Action |
 |---|---|
-| `Space` / `SOLVE` | CBS 풀기 (백그라운드 스레드) |
-| `r` / `Reset Sim` | 시뮬레이션 초기화 |
-| `+` / `-` | 재생 속도 조절 (0.5x ~ 20x) |
+| `Space` / `SOLVE` | Run CBS solver (background thread) |
+| `Space` / `CANCEL` | Cancel ongoing solve |
+| `r` / `Reset Sim` | Reset simulation |
+| `+` / `-` | Playback speed (0.5×–20×) |
 
-### 화면 이동 / 줌
+### View
 
-| 조작 | 기능 |
+| Input | Action |
 |---|---|
-| 마우스 휠 | 줌 인/아웃 (셀 크기 8 ~ 40 px) |
-| 중간 버튼(휠 클릭) 드래그 | 맵 패닝 |
+| Mouse wheel | Zoom in/out (8–40 px/cell) |
+| Middle-button drag | Pan |
+| `Tab` | Toggle live CBS visualisation ON/OFF |
 
-### 파일
+### Agent Body
 
-| 버튼 | 기능 |
+| Key | Action |
 |---|---|
-| `Save Map` | 현재 맵을 PGM+YAML로 저장 |
-| `Load Map` | PGM+YAML 맵 불러오기 |
-| `Clear Agents` | 에이전트만 초기화 |
-| `Clear All` | 맵 + 에이전트 전체 초기화 |
+| `z` | Decrease agent radius −0.5 cells |
+| `x` | Increase agent radius +0.5 cells |
+
+### File / Map
+
+| Button | Action |
+|---|---|
+| `Save Map` | Save current grid as PGM+YAML |
+| `Load Map` | Load PGM+YAML map |
+| `New Map...` | Dialog to set cols × rows × cell size |
+| `Clear Agents` | Remove all agents |
+| `Clear All` | Clear map and agents |
+
+### Solver Settings (sidebar sliders)
+
+| Control | Range | Step |
+|---|---|---|
+| Timeout | 5–300 s | 10 s |
+| Max nodes | 500–100 000 | 500 |
 
 ---
 
-## 시각 표현
+## Agent Body & Collision
 
-| 요소 | 표현 |
+Each agent has a configurable **radius** (in cells, default 1.5).
+
+- **Obstacle clearance**: A* only visits cells where all cells within `radius` are free.
+- **Inter-agent collision**: two agents conflict when their Euclidean distance < `2 × radius`.
+- **Visual**: the agent circle is drawn at `radius × cell_size` pixels.
+
+Minimum corridor width for two agents to pass: `> 4 × radius` cells.
+
+---
+
+## CBS Solver Details
+
+| Feature | Description |
 |---|---|
-| 에이전트 현재 위치 | 색상 원 |
-| 에이전트 목표 지점 | 동색 빈 사각형 |
-| 경로 | 동색 얇은 선 |
-| 선택된 에이전트 | 흰색 테두리 |
+| Low-level planner | Space-time A* with vertex + edge constraints |
+| Duplicate detection | Path-combination memoization — same path set is never re-evaluated |
+| Conflict types | Vertex conflicts (distance-based) + edge conflicts (swap) |
+| Termination | `[PROVEN] No solution` when search space exhausted; `[NODE LIMIT]` / `[TIMEOUT]` otherwise |
 
-에이전트마다 고유 색상 (빨강, 초록, 파랑, 노랑, 보라, 청록, 주황, 연두 순).
+### Result messages
+
+| Message | Meaning |
+|---|---|
+| `Solution found!` | Optimal conflict-free paths found |
+| `[PROVEN] No solution exists` | Search space fully exhausted — impossible configuration |
+| `[NODE LIMIT N]` | Node cap reached — may be solvable, increase limit or simplify |
+| `[TIMEOUT Xs]` | Time cap reached — same as above |
+| `Cancelled` | Manually cancelled by user |
+
+---
+
+## Visualisation
+
+| Element | Appearance |
+|---|---|
+| Agent (static) | Filled circle with color ring |
+| Agent (simulating) | Filled circle, smooth interpolation between steps |
+| Goal marker | Hollow square in agent color |
+| Planned path | Thin line in agent color |
+| CBS candidate paths | Dim lines (live, during solve) |
+| Conflict marker | Pulsing red ring + `t=N` timestep label |
+
+Agent colors (in order): red, green, blue, yellow, purple, cyan, orange, lime.
