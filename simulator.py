@@ -8,7 +8,7 @@ from cbs import solve_cbs
 
 # ── Palette ────────────────────────────────────────────────────────────────────
 BG            = (28,  28,  32)
-GRID_LINE     = (50,  50,  56)
+GRID_LINE     = (175, 175, 180)
 FREE_CELL     = (200, 200, 205)
 OBS_CELL      = (38,  38,  42)
 SIDEBAR_BG    = (42,  42,  52)
@@ -20,16 +20,15 @@ BTN_HOVER     = (80,  88,  128)
 BTN_ACTIVE    = (95,  108, 170)
 MSG_BG        = (0,   0,   0,  190)
 
-AGENT_COLORS = [
-    (230,  75,  75),
-    ( 75, 200,  75),
-    ( 75, 120, 230),
-    (230, 185,  55),
-    (185,  75, 220),
-    ( 55, 205, 205),
-    (230, 130,  55),
-    (145, 225,  75),
-]
+import colorsys as _colorsys
+
+MAX_AGENTS = 99
+
+def agent_color(idx):
+    """Visually distinct color for any agent index using golden-ratio hue spacing."""
+    h = (idx * 0.618033988749895) % 1.0
+    r, g, b = _colorsys.hsv_to_rgb(h, 0.78, 0.92)
+    return (int(r * 255), int(g * 255), int(b * 255))
 
 SIDEBAR_W   = 225
 CELL_DEFAULT      =  8
@@ -37,8 +36,9 @@ SOLVE_TIMEOUT_DEFAULT = 30.0
 CELL_MIN     =  8
 CELL_MAX     = 40
 
-MODE_OBS  = "obstacle"
-MODE_AGNT = "agent"
+MODE_OBS   = "obstacle"
+MODE_ERASE = "erase"
+MODE_AGNT  = "agent"
 
 SUB_NONE  = 0
 SUB_START = 1
@@ -77,7 +77,7 @@ class Btn:
 
 # ── Main application ───────────────────────────────────────────────────────────
 class MAPFApp:
-    def __init__(self, cols=40, rows=30, cell=CELL_DEFAULT):
+    def __init__(self, cols=40, rows=30, cell=CELL_DEFAULT, last_map=None, cfg=None):
         pygame.init()
         pygame.display.set_caption("MAPF Simulator  -  CBS")
 
@@ -97,24 +97,59 @@ class MAPFApp:
         self.sim_t        = 0.0
         self.sim_step     = 0
         self.sim_run      = False
-        self.sim_speed    = 5.0         # steps / second
-        self.agent_radius = 1.5         # physical radius in cells
+        c = cfg or {}
+        self.sim_speed    = float(c.get("sim_speed",    5.0))
+        self.agent_radius = float(c.get("agent_radius", 1.5))
 
         self._solving       = False
         self._sol_result    = None
         self._sol_error     = ""
         self._stop_event    = threading.Event()
         self._solve_start   = 0.0
-        self.solve_timeout  = SOLVE_TIMEOUT_DEFAULT   # adjustable
-        self.max_nodes      = 5000                    # CBS node expansion limit
+        self.solve_timeout  = float(c.get("solve_timeout", SOLVE_TIMEOUT_DEFAULT))
+        self.max_nodes      = int(c.get("max_nodes", 5000))
         self._cbs_progress  = {}
         self._show_progress = True     # toggle with Tab
 
-        self._drag_painting = False
-        self._drag_val      = True
+        self._drag_painting    = False
+        self._drag_val         = True
+        self._agent_list_scroll = 0    # top agent index shown in sidebar
+
+        # ── Continuous / auto mode ────────────────────────────────────────────
+        self._cont_mode        = False
+        self._cont_replan_mode = 0     # 0=A*, 1=CBS round-trip, 2=RHCR
+        self._cont_agents      = {}    # {agent_idx: {'path','local_t','goal','arrivals'}}
+        self._cont_total       = 0
+        self._safe_cache       = None
+        self._cont_cbs_run     = False
+        self._cont_cbs_pend    = False
+        self._cont_cbs_res     = None
+        self._cont_cbs_snap    = {}
+        self._cont_cbs_frac    = {}
+        self._cont_progress    = {}
+        self._rhcr_window      = int(c.get("rhcr_window", 12))  # W: planning horizon (CBS depth)
+        self._rhcr_h           = int(c.get("rhcr_h",      5))   # H: execution steps before replan (H <= W)
+        self._rhcr_global_t    = 0.0   # cumulative sim steps in cont mode
+        self._rhcr_last_t      = 0.0   # global_t at last RHCR replan
+        self._rhcr_arrived     = set() # agents counted as arrived (waiting for replan)
 
         self.msg       = ""
         self.msg_ticks = 0
+
+        # ── Performance stats ─────────────────────────────────────────────────
+        self._stat_fps        = 0.0
+        self._stat_frame_ms   = 0.0
+        self._stat_replan_ms  = 0.0
+        self._stat_replan_cnt = 0
+        self._stat_replan_t   = 0.0
+        self._stat_replan_ps  = 0.0
+        self._throughput_window = []  # timestamps of recent arrivals (last 60s)
+        self._throughput        = 0.0  # tasks/min
+
+        # ── A* async replanning ───────────────────────────────────────────────
+        self._astar_pending  = {}    # {idx: goal} waiting to be replanned
+        self._astar_running  = False # batch worker in progress
+        self._astar_results  = {}    # {idx: new_path} from worker
 
         self.font   = pygame.font.SysFont("consolas", 13)
         self.font_s = pygame.font.SysFont("consolas", 11)
@@ -130,6 +165,17 @@ class MAPFApp:
         self._btns  = []
         self._rebuild_btns()
 
+        # Auto-load last used map
+        if last_map and os.path.exists(last_map):
+            try:
+                grid, _ = Grid.from_pgm_yaml(last_map)
+                self.grid = grid
+                self._save_config(last_map)
+                self._show(f"Restored: {os.path.basename(last_map)}")
+                self._rebuild_btns()
+            except Exception:
+                pass
+
     # ── Button layout ──────────────────────────────────────────────────────────
     def _rebuild_btns(self):
         x0 = self._grid_area_w() + 8
@@ -142,7 +188,8 @@ class MAPFApp:
         def B(rect, label, cb, toggle=False):
             return Btn(rect, label, cb, toggle)
 
-        self.b_obs   = B((x0, y, w,      h), "Obstacle [1]",  lambda: self._set_mode(MODE_OBS),  True); y += h+g
+        self.b_obs   = B((x0,      y, hw, h), "Draw  [1]",  lambda: self._set_mode(MODE_OBS),   True)
+        self.b_era   = B((x0+hw+4, y, hw, h), "Erase [3]",  lambda: self._set_mode(MODE_ERASE), True); y += h+g
         self.b_agnt  = B((x0, y, w,      h), "Agent    [2]",  lambda: self._set_mode(MODE_AGNT), True); y += h+g*2
         self.b_add   = B((x0,       y, hw, h), "+Agent",        self._add_agent)
         self.b_del   = B((x0+hw+4,  y, hw, h), "-Agent",        self._del_agent); y += h+g
@@ -156,29 +203,38 @@ class MAPFApp:
         y += 18
         # Max-nodes row       (label 14px + gap)
         y += 18+g
-        self.b_solve  = B((x0, y, w, h), "SOLVE  [Space]", self._solve_or_cancel);          y += h+g
+        self.b_auto_astar = B((x0, y, w, h), "Auto: A*   [a]", lambda: self._start_auto(0), True); y += h+g
+        self.b_auto_cbs   = B((x0, y, w, h), "Auto: CBS  [b]", lambda: self._start_auto(1), True); y += h+g
+        self.b_auto_rhcr  = B((x0, y, w, h), "Auto: RHCR [h]", lambda: self._start_auto(2), True); y += h+g
+        self.b_solve  = B((x0, y, w, h), "SOLVE CBS [Space]", self._solve_or_cancel);               y += h+g
         self.b_rsim  = B((x0, y, w, h), "Reset Sim  [r]", self._reset_sim);                y += h+g*2
         self.b_save  = B((x0,       y, hw, h), "Save Map", self._save_map)
         self.b_load  = B((x0+hw+4,  y, hw, h), "Load Map", self._load_map);                y += h+g
         self.b_new   = B((x0, y, w, h), "New Map...",     self._new_map);                  y += h+g
+        self.b_rand  = B((x0, y, w, h), "Random Agents",  self._random_agents);             y += h+g
         self.b_clag  = B((x0, y, w, h), "Clear Agents",   self._clear_agents);             y += h+g
         self.b_call  = B((x0, y, w, h), "Clear All",      self._clear_all)
 
         self._btns = [
-            self.b_obs, self.b_agnt,
+            self.b_obs, self.b_era, self.b_agnt,
             self.b_add, self.b_del,
             self.b_start, self.b_goal,
+            self.b_auto_astar, self.b_auto_cbs, self.b_auto_rhcr,
             self.b_solve, self.b_rsim,
             self.b_save, self.b_load,
-            self.b_new, self.b_clag, self.b_call,
+            self.b_new, self.b_rand, self.b_clag, self.b_call,
         ]
         self._refresh_btn_state()
 
     def _refresh_btn_state(self):
-        self.b_obs.active   = (self.mode == MODE_OBS)
-        self.b_agnt.active  = (self.mode == MODE_AGNT)
-        self.b_start.active = (self.edit_sub == SUB_START)
-        self.b_goal.active  = (self.edit_sub == SUB_GOAL)
+        self.b_obs.active      = (self.mode == MODE_OBS)
+        self.b_era.active      = (self.mode == MODE_ERASE)
+        self.b_agnt.active     = (self.mode == MODE_AGNT)
+        self.b_start.active    = (self.edit_sub == SUB_START)
+        self.b_goal.active     = (self.edit_sub == SUB_GOAL)
+        self.b_auto_astar.active = self._cont_mode and self._cont_replan_mode == 0
+        self.b_auto_cbs.active   = self._cont_mode and self._cont_replan_mode == 1
+        self.b_auto_rhcr.active  = self._cont_mode and self._cont_replan_mode == 2
 
     def _reposition_btns(self):
         self._rebuild_btns()
@@ -199,6 +255,16 @@ class MAPFApp:
             int(c * self.cell + self.cam_x),
             int(r * self.cell + self.cam_y),
         )
+
+    def _record_arrival(self):
+        """Call each time any agent completes a task. Updates throughput."""
+        now = time.time()
+        self._throughput_window.append(now)
+        # Keep only last 60 seconds
+        cutoff = now - 60.0
+        self._throughput_window = [t for t in self._throughput_window if t > cutoff]
+        # tasks/min = count in last 60s
+        self._throughput = len(self._throughput_window)
 
     def _show(self, msg, secs=3):
         self.msg       = msg
@@ -221,8 +287,8 @@ class MAPFApp:
         self._refresh_btn_state()
 
     def _add_agent(self):
-        if len(self.agents) >= 8:
-            self._show("Max 8 agents.")
+        if len(self.agents) >= MAX_AGENTS:
+            self._show(f"Max {MAX_AGENTS} agents.")
             return
         self.agents.append({"start": None, "goal": None})
         self.sel      = len(self.agents) - 1
@@ -259,6 +325,11 @@ class MAPFApp:
             self._add_or_remove_obstacle(c, r, placing)
             self._drag_painting = True
             self._drag_val      = placing
+
+        elif self.mode == MODE_ERASE:
+            self._add_or_remove_obstacle(c, r, False)
+            self._drag_painting = True
+            self._drag_val      = False
 
         elif self.mode == MODE_AGNT:
             if not self.agents:
@@ -351,11 +422,46 @@ class MAPFApp:
         self._solving = False
 
     def _reset_sim(self):
-        self.sim_run    = False
-        self.sim_t      = 0.0
-        self.sim_step   = 0
-        self.paths      = {}
+        self.sim_run     = False
+        self.sim_t       = 0.0
+        self.sim_step    = 0
+        self.paths       = {}
         self._sol_result = None
+        # Stop cont mode without clearing its state (let _toggle handle that)
+        if not self._cont_mode:
+            self._cont_agents = {}
+            self._cont_total  = 0
+
+    # ── Config persistence ────────────────────────────────────────────────────
+    def _save_config(self, map_path=None):
+        import json
+        config_path = os.path.join(os.path.dirname(__file__), "config.json")
+        # Load existing to preserve last_map if not overwriting
+        cfg = {}
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, encoding="utf-8") as f:
+                    cfg = json.load(f)
+            except Exception:
+                pass
+
+        if map_path:
+            cfg["last_map"] = os.path.abspath(map_path)
+        cfg["cols"]          = self.grid.width
+        cfg["rows"]          = self.grid.height
+        cfg["cell"]          = self.cell
+        cfg["agent_radius"]  = self.agent_radius
+        cfg["sim_speed"]     = self.sim_speed
+        cfg["solve_timeout"] = self.solve_timeout
+        cfg["max_nodes"]     = self.max_nodes
+        cfg["rhcr_window"]   = self._rhcr_window
+        cfg["rhcr_h"]        = self._rhcr_h
+
+        try:
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2)
+        except Exception:
+            pass
 
     # ── Map I/O ───────────────────────────────────────────────────────────────
     def _save_map(self):
@@ -371,6 +477,7 @@ class MAPFApp:
             if path:
                 pgm = os.path.splitext(path)[0] + ".pgm"
                 self.grid.save_pgm_yaml(pgm, path)
+                self._save_config(path)
                 self._show(f"Saved: {os.path.basename(path)}")
         except Exception as e:
             self._show(f"Save error: {e}")
@@ -387,6 +494,7 @@ class MAPFApp:
             if path:
                 grid, _ = Grid.from_pgm_yaml(path)
                 self.grid = grid
+                self._save_config(path)
                 self._reset_sim()
                 self._clamp_cam()
                 self._rebuild_btns()
@@ -404,6 +512,339 @@ class MAPFApp:
         self.agents = []
         self.sel    = 0
         self._reset_sim()
+
+    # ── Continuous / Auto mode ────────────────────────────────────────────────
+
+    def _stop_cont_mode(self):
+        self._cont_mode     = False
+        self._cont_agents   = {}
+        self._safe_cache    = None
+        self._cont_cbs_run  = False
+        self._cont_cbs_pend = False
+        self._cont_cbs_res  = None
+        self._cont_progress = {}
+        self._rhcr_global_t = 0.0
+        self._rhcr_last_t   = 0.0
+        self._rhcr_arrived.clear()
+        self._show("Auto mode stopped.")
+        self._refresh_btn_state()
+
+    def _start_auto(self, mode):
+        """Start auto mode with the given replan mode (0=A*, 1=CBS, 2=RHCR).
+        If the same mode is already active, stop it. Otherwise switch modes."""
+        if self._cont_mode and self._cont_replan_mode == mode:
+            self._stop_cont_mode()
+        elif self._cont_mode:
+            self._stop_cont_mode()
+            self._cont_replan_mode = mode
+            self._start_cont_mode()
+            self._refresh_btn_state()
+        else:
+            self._cont_replan_mode = mode
+            self._start_cont_mode()
+            self._refresh_btn_state()
+
+    def _start_cont_mode(self):
+        import random
+        from cbs import compute_safe_positions
+        from astar import astar
+
+        valid = [(i, a) for i, a in enumerate(self.agents) if a["start"] and a["goal"]]
+        if not valid:
+            self._show("No agents ready. Set start+goal or use 'Random Agents'.")
+            return
+
+        self._show("Building safe map...")
+        self._safe_cache = compute_safe_positions(self.grid, self.agent_radius)
+        safe = self._safe_cache
+
+        self._cont_agents = {}
+        self._cont_total  = 0
+
+        for idx, a in valid:
+            # Use current CBS position if available, else start
+            if idx in self.paths:
+                st = min(self.sim_step, len(self.paths[idx]) - 1)
+                start = self.paths[idx][st]
+            else:
+                start = a["start"]
+
+            goal = a["goal"]
+            if start not in safe:
+                start = min(safe, key=lambda p: abs(p[0]-start[0]) + abs(p[1]-start[1]))
+            if goal not in safe:
+                goal = min(safe, key=lambda p: abs(p[0]-goal[0]) + abs(p[1]-goal[1]))
+
+            path = astar(self.grid, start, goal, safe_positions=safe)
+            if path is None:
+                path = [start]
+
+            self._cont_agents[idx] = {
+                "path":     path,
+                "local_t":  0.0,
+                "goal":     goal,
+                "arrivals": 0,
+            }
+
+        self._cont_mode = True   # set BEFORE _reset_sim so cont_agents aren't cleared
+        self._rhcr_arrived.clear()
+        self._rhcr_global_t = 0.0
+        if self._cont_replan_mode == 2:
+            # Trigger first replan immediately so RHCR starts coordinated
+            self._rhcr_last_t = -float(self._rhcr_h)
+        else:
+            self._rhcr_last_t = 0.0
+        self._reset_sim()
+        mode_names = ["A*", "CBS", "RHCR"]
+        self._show(f"Auto({mode_names[self._cont_replan_mode]}): {len(self._cont_agents)} agents running.")
+
+    def _pick_new_goal(self, idx):
+        """Pick a spread-out random goal for agent idx, avoiding other agents/goals."""
+        import random, math
+        safe     = self._safe_cache or set()
+        min_dist = self.agent_radius * 2 + 0.5
+        ca   = self._cont_agents[idx]
+        path = ca["path"]
+        cur  = path[min(int(ca["local_t"]), len(path) - 1)]
+
+        others = []
+        for k, v in self._cont_agents.items():
+            if k == idx:
+                continue
+            op = v["path"]
+            os = min(int(v["local_t"]), len(op) - 1)
+            others.append(op[os])
+            others.append(v["goal"])
+
+        cands = [
+            p for p in safe
+            if p != cur and
+            all(math.sqrt((p[0]-o[0])**2 + (p[1]-o[1])**2) >= min_dist for o in others)
+        ]
+        if not cands:
+            cands = [p for p in safe if p != cur]
+        return random.choice(cands) if cands else None
+
+    # Pre-computed body footprint offsets for the current agent_radius
+    # (cached to avoid repeating sqrt every replan)
+    _footprint_cache: tuple = (None, [])   # (radius, offsets)
+
+    def _body_offsets(self):
+        """Return list of (dc, dr) offsets within 2*agent_radius (cached)."""
+        import math
+        radius = self.agent_radius * 2
+        cached_r, offsets = MAPFApp._footprint_cache
+        if cached_r != radius:
+            r_ceil = int(math.ceil(radius - 0.001))
+            offsets = [
+                (dc, dr)
+                for dc in range(-r_ceil, r_ceil + 1)
+                for dr in range(-r_ceil, r_ceil + 1)
+                if math.sqrt(dc*dc + dr*dr) < radius
+            ]
+            MAPFApp._footprint_cache = (radius, offsets)
+        return offsets
+
+    _CONSTRAINT_HORIZON = 30   # only look ahead this many steps (speed vs accuracy)
+
+    def _cont_replan_agent(self, idx):
+        """Replan path for one agent to its CURRENT goal using soft constraints from others.
+        Does NOT change the goal — goal assignment is the caller's responsibility."""
+        from astar import astar
+
+        safe = self._safe_cache
+        if safe is None:
+            return
+
+        ca    = self._cont_agents[idx]
+        path  = ca["path"]
+        step  = min(int(ca["local_t"]), len(path) - 1)
+        start = path[step]
+        goal  = ca["goal"]
+
+        offsets = self._body_offsets()
+        horizon = self._CONSTRAINT_HORIZON
+        vc = set()
+        for oi, oa in self._cont_agents.items():
+            if oi == idx:
+                continue
+            op  = oa["path"]
+            ot  = min(int(oa["local_t"]), len(op) - 1)
+            end = min(ot + horizon, len(op))      # limit lookahead
+            for dt, pi in enumerate(range(ot, end)):
+                c, r = op[pi]
+                for dc, dr in offsets:
+                    vc.add((c + dc, r + dr, dt + 1))
+
+        t0 = time.time()
+        new_path = astar(self.grid, start, goal, vc, set(),
+                         max_time=200, safe_positions=safe)
+        if new_path is None:
+            new_path = astar(self.grid, start, goal, safe_positions=safe)
+        if new_path is None:
+            new_path = [start]
+        self._stat_replan_ms  = (time.time() - t0) * 1000
+        self._stat_replan_cnt += 1
+
+        ca["path"]    = new_path
+        ca["local_t"] = 0.0
+
+    def _launch_astar_batch(self):
+        """Run pending A* replans in a background thread."""
+        if self._astar_running or not self._astar_pending:
+            return
+        batch = dict(self._astar_pending)
+        self._astar_pending.clear()
+        self._astar_running = True
+
+        def worker():
+            t0 = time.time()
+            results = {}
+            for idx, goal in batch.items():
+                if idx not in self._cont_agents:
+                    continue
+                ca    = self._cont_agents[idx]
+                path  = ca["path"]
+                step  = min(int(ca["local_t"]), len(path) - 1)
+                start = path[step]
+                safe  = self._safe_cache
+
+                offsets = self._body_offsets()
+                horizon = self._CONSTRAINT_HORIZON
+                vc = set()
+                for oi, oa in self._cont_agents.items():
+                    if oi == idx:
+                        continue
+                    op  = oa["path"]
+                    ot  = min(int(oa["local_t"]), len(op) - 1)
+                    frozen = (ot >= len(op) - 1)
+                    if frozen:
+                        # Frozen agent: treat as static obstacle for all future steps
+                        c, r = op[ot]
+                        for future_dt in range(horizon):
+                            for dc, dr in offsets:
+                                vc.add((c + dc, r + dr, future_dt + 1))
+                        continue
+                    end = min(ot + horizon, len(op))
+                    for dt, pi in enumerate(range(ot, end)):
+                        c, r = op[pi]
+                        for dc, dr in offsets:
+                            vc.add((c + dc, r + dr, dt + 1))
+
+                from astar import astar
+                new_path = astar(self.grid, start, goal, vc, set(),
+                                 max_time=200, safe_positions=safe)
+                if new_path is None:
+                    new_path = astar(self.grid, start, goal, safe_positions=safe)
+                if new_path is None:
+                    new_path = [start]
+                results[idx] = new_path
+
+            elapsed = (time.time() - t0) * 1000
+            self._astar_results  = results
+            self._stat_replan_ms  = elapsed
+            self._stat_replan_cnt += len(results)
+            self._astar_running   = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _cont_replan_cbs_all(self):
+        """Launch CBS for all cont agents in background. Agents keep moving on old paths.
+        Records each agent's local_t at snapshot time so the result can be
+        offset-compensated on arrival (skip steps already traveled during CBS runtime)."""
+        if self._cont_cbs_run:
+            self._cont_cbs_pend = True
+            return
+
+        from cbs import solve_cbs
+        safe = self._safe_cache
+
+        # Snapshot positions and fractional local_t for smooth path handoff
+        agents_snap  = []
+        indices      = []
+        snap_local_t = {}
+        snap_frac    = {}   # {idx: fractional part of local_t} for visual continuity
+        for idx, ca in self._cont_agents.items():
+            path  = ca["path"]
+            lt    = ca["local_t"]
+            step  = min(int(lt), len(path) - 1)
+            start = path[step]
+            goal  = ca["goal"]
+            agents_snap.append({"start": start, "goal": goal})
+            indices.append(idx)
+            snap_local_t[idx] = lt
+            snap_frac[idx]    = lt - int(lt)   # e.g. 4.97 → 0.97
+
+        self._stop_event.clear()   # reset any leftover cancel from manual solver
+        self._cont_cbs_run  = True
+        self._cont_cbs_snap = snap_local_t
+        self._cont_cbs_frac = snap_frac
+        self._cont_progress.clear()
+
+        rhcr_horizon = self._rhcr_window if self._cont_replan_mode == 2 else None
+
+        def worker():
+            result = solve_cbs(
+                self.grid, agents_snap,
+                max_time=300, agent_radius=self.agent_radius,
+                stop_event=self._stop_event,
+                max_nodes=self.max_nodes,
+                progress=self._cont_progress,
+                horizon=rhcr_horizon,
+            )
+            self._cont_cbs_res = (result, list(indices))
+            self._cont_cbs_run = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _random_agents(self):
+        import random
+        from tkinter import simpledialog, Tk
+
+        root = Tk(); root.withdraw()
+        n = simpledialog.askinteger(
+            "Random Agents", f"How many agents? (1-{MAX_AGENTS})",
+            minvalue=1, maxvalue=MAX_AGENTS,
+            initialvalue=min(10, MAX_AGENTS - len(self.agents))
+        )
+        root.destroy()
+        if not n:
+            return
+
+        from cbs import compute_safe_positions
+        safe = list(compute_safe_positions(self.grid, self.agent_radius))
+
+        # Remove positions already used by existing agents
+        used = set()
+        for a in self.agents:
+            if a["start"]: used.add(a["start"])
+            if a["goal"]:  used.add(a["goal"])
+        available = [p for p in safe if p not in used]
+
+        # Sample 2n positions where every pair is >= 2*radius apart
+        # (prevents t=0 conflicts and goal conflicts)
+        chosen = self._spread_sample(available, n * 2)
+        if len(chosen) < 2:
+            self._show("Not enough spread-out safe positions. Try smaller radius or larger map.")
+            return
+        # Round down to even count
+        actual = len(chosen) // 2
+        if actual < n:
+            self._show(f"Only space for {actual} spread agents (radius={self.agent_radius}).")
+            n = actual
+        chosen  = chosen[:n * 2]
+        starts, goals = chosen[:n], chosen[n:]
+
+        added = 0
+        for i in range(n):
+            if len(self.agents) >= MAX_AGENTS:
+                break
+            self.agents.append({"start": starts[i], "goal": goals[i]})
+            added += 1
+
+        self.sel = max(0, len(self.agents) - 1)
+        self._reset_sim()
+        self._show(f"Added {added} agents — no position overlaps (total: {len(self.agents)}).")
 
     def _new_map(self):
         try:
@@ -471,6 +912,23 @@ class MAPFApp:
             self._show(f"Error: {e}")
 
     # ── Camera ────────────────────────────────────────────────────────────────
+    def _spread_sample(self, positions, n, min_dist=None):
+        """Sample up to n positions where every pair is >= min_dist apart.
+        Defaults to 2*agent_radius + 0.5 so agents don't conflict at t=0."""
+        import math, random
+        if min_dist is None:
+            min_dist = self.agent_radius * 2 + 0.5
+        pool   = list(positions)
+        random.shuffle(pool)
+        result = []
+        for pos in pool:
+            if len(result) >= n:
+                break
+            if all(math.sqrt((pos[0]-s[0])**2 + (pos[1]-s[1])**2) >= min_dist
+                   for s in result):
+                result.append(pos)
+        return result
+
     def _clamp_cam(self):
         ga_w = self._grid_area_w()
         ga_h = self.screen.get_height()
@@ -510,8 +968,165 @@ class MAPFApp:
                 self.sim_step = max_steps - 1
                 self.sim_run  = False
 
+        # ── Continuous mode tick ──────────────────────────────────────────────
+        if self._cont_mode and self._cont_agents:
+            # Pick up A* batch results from worker
+            if self._astar_results:
+                for idx, new_path in self._astar_results.items():
+                    if idx in self._cont_agents:
+                        self._cont_agents[idx]["path"]    = new_path
+                        self._cont_agents[idx]["local_t"] = 0.0
+                self._astar_results = {}
+                if self._astar_pending:
+                    self._launch_astar_batch()
+
+            # Pick up CBS result from worker
+            if self._cont_cbs_res is not None:
+                result, indices = self._cont_cbs_res
+                self._cont_cbs_res = None
+                if result:
+                    frac = getattr(self, '_cont_cbs_frac', {})
+                    for j, idx in enumerate(indices):
+                        if idx not in self._cont_agents or j not in result:
+                            continue
+                        # Preserve fractional local_t so robot doesn't snap back visually
+                        self._cont_agents[idx]["path"]    = result[j]
+                        self._cont_agents[idx]["local_t"] = frac.get(idx, 0.0)
+                        self._rhcr_arrived.discard(idx)
+                else:
+                    reason = self._cont_progress.get('terminated', 'unknown')
+                    nodes  = self._cont_progress.get('nodes', 0)
+                    self._show(f"CBS failed [{reason} nodes={nodes}] — holding position", secs=4)
+                if self._cont_cbs_pend:
+                    self._cont_cbs_pend = False
+
+            import random, math
+            min_dist = self.agent_radius * 2 + 0.5
+            safe     = self._safe_cache or set()
+
+            if self._cont_replan_mode == 1:
+                # ── CBS round-trip: ALL arrive → assign new goals → replan ────
+                for idx, ca in self._cont_agents.items():
+                    path = ca["path"]
+                    at_goal = (int(ca["local_t"]) >= len(path) - 1
+                               and path[-1] == ca["goal"])
+                    if not at_goal:
+                        ca["local_t"] += dt * self.sim_speed
+
+                all_at_goal = all(
+                    int(ca["local_t"]) >= len(ca["path"]) - 1
+                    and ca["path"][-1] == ca["goal"]
+                    for ca in self._cont_agents.values()
+                )
+                if all_at_goal and not self._cont_cbs_run:
+                    cur_positions = [ca["path"][-1] for ca in self._cont_agents.values()]
+                    new_goals = self._spread_sample(
+                        [p for p in safe if p not in cur_positions],
+                        len(self._cont_agents)
+                    )
+                    for i, (idx, ca) in enumerate(self._cont_agents.items()):
+                        ca["arrivals"] += 1
+                        self._cont_total += 1
+                        self._record_arrival()
+                        if i < len(new_goals):
+                            ca["goal"] = new_goals[i]
+                    self._cont_replan_cbs_all()
+
+            elif self._cont_replan_mode == 2:
+                # ── RHCR: freeze during CBS, then replan every W steps ────────
+                if not self._cont_cbs_run:
+                    self._rhcr_global_t += dt * self.sim_speed
+
+                    # Advance agents; clamp at end of path
+                    for idx, ca in self._cont_agents.items():
+                        path = ca["path"]
+                        if int(ca["local_t"]) < len(path) - 1:
+                            ca["local_t"] += dt * self.sim_speed
+                        else:
+                            ca["local_t"] = float(len(path) - 1)
+
+                    # Arrival detection (one-time per goal, guarded by _rhcr_arrived)
+                    for idx, ca in self._cont_agents.items():
+                        if idx in self._rhcr_arrived:
+                            continue
+                        path = ca["path"]
+                        if (int(ca["local_t"]) >= len(path) - 1
+                                and path[-1] == ca["goal"]):
+                            self._rhcr_arrived.add(idx)
+                            ca["arrivals"] += 1
+                            self._cont_total += 1
+                            self._record_arrival()
+                            new_goal = self._pick_new_goal(idx)
+                            if new_goal:
+                                ca["goal"] = new_goal
+
+                    # H steps elapsed → launch CBS for next W-step window
+                    if self._rhcr_global_t - self._rhcr_last_t >= self._rhcr_h:
+                        self._rhcr_last_t = self._rhcr_global_t
+                        # Snap local_t to integer so CBS result has no visual jump
+                        for ca2 in self._cont_agents.values():
+                            ca2["local_t"] = float(int(ca2["local_t"]))
+                        self._cont_replan_cbs_all()
+
+            else:
+                # ── A* mode: arrived OR stuck → assign new goal → replan ──────
+                for idx, ca in self._cont_agents.items():
+                    path = ca["path"]
+                    at_goal = (int(ca["local_t"]) >= len(path) - 1
+                               and path[-1] == ca["goal"])
+                    if not at_goal:
+                        ca["local_t"] += dt * self.sim_speed
+
+                for idx, ca in self._cont_agents.items():
+                    if idx in self._astar_pending:
+                        continue
+                    path = ca["path"]
+                    at_end = int(ca["local_t"]) >= len(path) - 1
+                    if not at_end:
+                        continue
+
+                    arrived = path[-1] == ca["goal"]
+                    if arrived:
+                        ca["arrivals"] += 1
+                        self._cont_total += 1
+                        self._record_arrival()
+
+                    cur = path[-1]
+                    others = []
+                    for k, v in self._cont_agents.items():
+                        if k == idx: continue
+                        op = v["path"]
+                        os = min(int(v["local_t"]), len(op)-1)
+                        others.append(op[os])
+                        others.append(v["goal"])
+                    cands = [
+                        p for p in safe
+                        if p != cur and
+                        all(math.sqrt((p[0]-o[0])**2+(p[1]-o[1])**2) >= min_dist
+                            for o in others)
+                    ]
+                    if not cands:
+                        cands = [p for p in safe if p != cur]
+                    if cands:
+                        ca["goal"] = random.choice(cands)
+                    else:
+                        continue
+
+                    self._astar_pending[idx] = ca["goal"]
+
+                self._launch_astar_batch()
+
         if self.msg_ticks > 0:
             self.msg_ticks -= 1
+
+        # FPS & replans/sec tracking
+        self._stat_fps      = self.clock.get_fps()
+        self._stat_frame_ms = dt * 1000
+        self._stat_replan_t += dt
+        if self._stat_replan_t >= 1.0:
+            self._stat_replan_ps  = self._stat_replan_cnt / self._stat_replan_t
+            self._stat_replan_cnt = 0
+            self._stat_replan_t   = 0.0
 
     # ── Draw ──────────────────────────────────────────────────────────────────
     def draw(self):
@@ -519,15 +1134,62 @@ class MAPFApp:
         self._draw_grid()
         if self._solving and self._show_progress:
             self._draw_cbs_progress()
-        self._draw_paths()
-        self._draw_agents()
+        if self._cont_mode and self._cont_cbs_run and self._show_progress:
+            self._draw_cbs_progress(progress=self._cont_progress)
+        if self._cont_mode:
+            self._draw_cont_agents()
+        else:
+            self._draw_paths()
+            self._draw_agents()
         self._draw_sidebar()
+        self._draw_stat_bar()
         if self.msg and self.msg_ticks > 0:
             self._draw_msg()
         pygame.display.flip()
 
-    def _draw_cbs_progress(self):
-        prog = self._cbs_progress
+    def _draw_cont_agents(self):
+        cell   = self.cell
+        radius = max(4, int(self.agent_radius * cell))
+
+        for idx, ca in self._cont_agents.items():
+            color  = agent_color(idx)
+            dim    = tuple(max(0, v - 100) for v in color)
+            path   = ca["path"]
+            local_t = ca["local_t"]
+            step   = min(int(local_t), len(path) - 1)
+            frac   = local_t - int(local_t)
+
+            # Remaining path (dim line)
+            for j in range(step, len(path) - 1):
+                x0 = int(path[j][0]   * cell + cell/2 + self.cam_x)
+                y0 = int(path[j][1]   * cell + cell/2 + self.cam_y)
+                x1 = int(path[j+1][0] * cell + cell/2 + self.cam_x)
+                y1 = int(path[j+1][1] * cell + cell/2 + self.cam_y)
+                pygame.draw.line(self.screen, dim, (x0, y0), (x1, y1), 1)
+
+            # Goal marker
+            gc, gr = ca["goal"]
+            gx = int(gc * cell + cell/2 + self.cam_x)
+            gy = int(gr * cell + cell/2 + self.cam_y)
+            s  = max(3, cell // 3)
+            pygame.draw.rect(self.screen, color, (gx-s, gy-s, s*2, s*2), 2)
+
+            # Interpolated agent position
+            if step < len(path) - 1:
+                c0, r0 = path[step]
+                c1, r1 = path[step + 1]
+                sx = (c0 + (c1 - c0) * frac) * cell + cell/2 + self.cam_x
+                sy = (r0 + (r1 - r0) * frac) * cell + cell/2 + self.cam_y
+            else:
+                c0, r0 = path[step]
+                sx = c0 * cell + cell/2 + self.cam_x
+                sy = r0 * cell + cell/2 + self.cam_y
+
+            pygame.draw.circle(self.screen, color, (int(sx), int(sy)), radius)
+            pygame.draw.circle(self.screen, (255, 255, 255), (int(sx), int(sy)), radius, 1)
+
+    def _draw_cbs_progress(self, progress=None):
+        prog = progress if progress is not None else self._cbs_progress
         if not prog:
             return
         cell  = self.cell
@@ -537,7 +1199,7 @@ class MAPFApp:
         # ── Candidate paths (dim, thin) ───────────────────────────────────────
         cand_paths = prog.get('paths', {})
         for idx, path in cand_paths.items():
-            color = AGENT_COLORS[self._valid_indices[idx] % len(AGENT_COLORS)] if hasattr(self, '_valid_indices') and idx < len(self._valid_indices) else AGENT_COLORS[idx % len(AGENT_COLORS)]
+            color = agent_color(self._valid_indices[idx]) if hasattr(self, '_valid_indices') and idx < len(self._valid_indices) else agent_color(idx)
             dim = tuple(max(0, v - 120) for v in color)
             if len(path) < 2:
                 continue
@@ -597,7 +1259,7 @@ class MAPFApp:
         if not self.paths:
             return
         for i, path in self.paths.items():
-            color = AGENT_COLORS[i % len(AGENT_COLORS)]
+            color = agent_color(i)
             dim   = tuple(max(0, v - 80) for v in color)
 
             if len(path) < 2:
@@ -617,7 +1279,7 @@ class MAPFApp:
         radius = max(4, int(self.agent_radius * cell))
 
         for i, agent in enumerate(self.agents):
-            color  = AGENT_COLORS[i % len(AGENT_COLORS)]
+            color  = agent_color(i)
             is_sel = (i == self.sel)
 
             # ── Animated position from path ──────────────────────────────────
@@ -724,25 +1386,58 @@ class MAPFApp:
         self._draw_adj_row(x0, ty+18, bar_w, f"Max nodes: {self.max_nodes}",
                            '_rect_nodes_minus', '_rect_nodes_plus')
 
-        # Agent list
+        # Agent list (scrollable)
         ay = self.b_call.rect.bottom + 12
-        self.screen.blit(self.font_s.render("Agents:", True, DIM), (x0+8, ay))
-        ay += 15
-        for i, a in enumerate(self.agents):
-            color  = AGENT_COLORS[i % len(AGENT_COLORS)]
+        list_h     = sh - ay - 80          # available height for list
+        row_h      = 15
+        visible    = max(1, list_h // row_h)
+
+        # Auto-scroll so selected agent is always visible
+        self._agent_list_scroll = max(0, min(
+            self._agent_list_scroll,
+            max(0, len(self.agents) - visible)
+        ))
+        if self.sel < self._agent_list_scroll:
+            self._agent_list_scroll = self.sel
+        elif self.sel >= self._agent_list_scroll + visible:
+            self._agent_list_scroll = self.sel - visible + 1
+
+        total = len(self.agents)
+        header = f"Agents: {total}/{MAX_AGENTS}"
+        self.screen.blit(self.font_s.render(header, True, DIM), (x0+8, ay))
+        ay += 14
+        self._agent_list_top = ay   # store for scroll hit-test
+
+        for slot in range(visible):
+            i = self._agent_list_scroll + slot
+            if i >= total:
+                break
+            a      = self.agents[i]
+            color  = agent_color(i)
             is_sel = (i == self.sel)
+            ry     = ay + slot * row_h
             if is_sel:
                 pygame.draw.rect(self.screen, (60, 65, 92),
-                                 (x0+6, ay-1, SIDEBAR_W-12, 16), border_radius=3)
-            pygame.draw.rect(self.screen, color, (x0+8, ay+3, 9, 9))
+                                 (x0+6, ry-1, SIDEBAR_W-12, row_h), border_radius=3)
+            pygame.draw.rect(self.screen, color, (x0+8, ry+3, 8, 8))
             s_s = f"({a['start'][0]},{a['start'][1]})" if a["start"] else "?"
             g_s = f"({a['goal'][0]},{a['goal'][1]})"   if a["goal"]  else "?"
-            row = self.font_s.render(f" A{i+1} S{s_s} G{g_s}", True, TEXT if is_sel else DIM)
-            self.screen.blit(row, (x0+20, ay))
-            ay += 16
+            row_txt = self.font_s.render(f" A{i+1} S{s_s} G{g_s}", True, TEXT if is_sel else DIM)
+            self.screen.blit(row_txt, (x0+19, ry))
+
+        # Scroll indicator
+        if total > visible:
+            bar_x  = x0 + SIDEBAR_W - 6
+            bar_top = ay
+            bar_bot = ay + visible * row_h
+            bar_h   = bar_bot - bar_top
+            thumb_h = max(12, bar_h * visible // total)
+            thumb_y = bar_top + (bar_h - thumb_h) * self._agent_list_scroll // max(1, total - visible)
+            pygame.draw.rect(self.screen, (50, 50, 65),  (bar_x, bar_top, 4, bar_h), border_radius=2)
+            pygame.draw.rect(self.screen, (100, 100, 130), (bar_x, thumb_y, 4, thumb_h), border_radius=2)
 
         # SOLVE 버튼 라벨 동적 변경
-        self.b_solve.label = "CANCEL [Space]" if self._solving else "SOLVE  [Space]"
+        self.b_solve.label = "CANCEL [Space]" if self._solving else "SOLVE CBS [Space]"
         self.b_solve.active = self._solving
 
         # Status bar
@@ -760,6 +1455,16 @@ class MAPFApp:
             prog_lbl = self.font_s.render(
                 f"[Tab] viz: {'ON' if self._show_progress else 'OFF'}", True, DIM)
             self.screen.blit(prog_lbl, (x0+8, sh-72))
+        elif self._cont_mode:
+            if self._cont_cbs_run:
+                nodes  = self._cont_progress.get('nodes', 0)
+                opens  = self._cont_progress.get('open_size', 0)
+                status = f"Auto CBS: computing...  nodes:{nodes} open:{opens}"
+                col    = (100, 220, 100)
+            else:
+                mode_s = ["A*", "CBS", "RHCR"][self._cont_replan_mode]
+                status = f"Auto({mode_s}): {self._cont_total} arrivals  ({len(self._cont_agents)} agents)"
+                col    = (100, 220, 180)
         elif self.sim_run:
             mx     = max((len(p) for p in self.paths.values()), default=1)
             status = f"Step {self.sim_step}/{mx-1}"
@@ -776,9 +1481,42 @@ class MAPFApp:
 
         # Mode / hint
         sub_str = ("", " [start]", " [goal]")[self.edit_sub]
-        m_str   = f"Mode: {self.mode}{sub_str}"
+        mode_label = {"obstacle": "Draw", "erase": "Erase", "agent": "Agent"}.get(self.mode, self.mode)
+        m_str   = f"Mode: {mode_label}{sub_str}"
         self.screen.blit(self.font_s.render(m_str,                True, (140, 140, 200)), (x0+8, sh-28))
         self.screen.blit(self.font_s.render("MMB=pan  Wheel=zoom", True, DIM),             (x0+8, sh-14))
+
+    def _draw_stat_bar(self):
+        sh   = self.screen.get_height()
+        ga_w = self._grid_area_w()
+        bar_h = 16
+        y     = sh - bar_h
+
+        pygame.draw.rect(self.screen, (20, 20, 24), (0, y, ga_w, bar_h))
+
+        parts = [f"FPS:{self._stat_fps:5.1f}", f"frame:{self._stat_frame_ms:5.1f}ms"]
+
+        if self._cont_mode:
+            if self._cont_replan_mode in (1, 2) and self._cont_cbs_run:
+                nodes = self._cont_progress.get('nodes', 0)
+                parts.append(f"CBS nodes:{nodes}")
+            elif self._cont_replan_mode == 2:
+                time_to_next = max(0.0, self._rhcr_h - (self._rhcr_global_t - self._rhcr_last_t))
+                parts.append(f"RHCR W={self._rhcr_window} H={self._rhcr_h} nxt:{time_to_next:.1f}  [[ ]],<.>")
+            else:
+                status = "A* running..." if self._astar_running else f"last A*:{self._stat_replan_ms:.0f}ms"
+                parts.append(status)
+                parts.append(f"replan:{self._stat_replan_ps:.1f}/s")
+            parts.append(f"arrivals:{self._cont_total}")
+            parts.append(f"throughput:{self._throughput:.0f} tasks/min")
+
+        if self._solving:
+            nodes = self._cbs_progress.get('nodes', 0)
+            opens = self._cbs_progress.get('open_size', 0)
+            parts.append(f"CBS nodes:{nodes}  open:{opens}")
+
+        txt = self.font_s.render("  |  ".join(parts), True, (140, 140, 155))
+        self.screen.blit(txt, (6, y + 2))
 
     def _draw_msg(self):
         txt = self.font.render(self.msg, True, (255, 255, 100))
@@ -799,6 +1537,7 @@ class MAPFApp:
 
             for ev in pygame.event.get():
                 if ev.type == pygame.QUIT:
+                    self._save_config()
                     running = False
 
                 elif ev.type == pygame.KEYDOWN:
@@ -810,6 +1549,7 @@ class MAPFApp:
                         self._refresh_btn_state()
                     elif k == pygame.K_1:                        self._set_mode(MODE_OBS)
                     elif k == pygame.K_2:                        self._set_mode(MODE_AGNT)
+                    elif k == pygame.K_3:                        self._set_mode(MODE_ERASE)
                     elif k == pygame.K_s and self.mode==MODE_AGNT: self._toggle_start()
                     elif k == pygame.K_g and self.mode==MODE_AGNT: self._toggle_goal()
                     elif k in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
@@ -820,8 +1560,27 @@ class MAPFApp:
                         self.agent_radius = round(min(4.0, self.agent_radius + 0.5), 1)
                     elif k == pygame.K_z:
                         self.agent_radius = round(max(0.5, self.agent_radius - 0.5), 1)
+                    elif k == pygame.K_a:
+                        self._start_auto(0)
+                    elif k == pygame.K_b:
+                        self._start_auto(1)
+                    elif k == pygame.K_h:
+                        self._start_auto(2)
                     elif k == pygame.K_TAB:
                         self._show_progress = not self._show_progress
+                    elif k == pygame.K_LEFTBRACKET:
+                        self._rhcr_window = max(self._rhcr_h, self._rhcr_window - 5)
+                        self._show(f"RHCR W={self._rhcr_window} H={self._rhcr_h}")
+                    elif k == pygame.K_RIGHTBRACKET:
+                        self._rhcr_window = min(200, self._rhcr_window + 5)
+                        self._show(f"RHCR W={self._rhcr_window} H={self._rhcr_h}")
+                    elif k == pygame.K_COMMA:
+                        self._rhcr_h = max(1, self._rhcr_h - 1)
+                        self._rhcr_window = max(self._rhcr_window, self._rhcr_h)
+                        self._show(f"RHCR W={self._rhcr_window} H={self._rhcr_h}")
+                    elif k == pygame.K_PERIOD:
+                        self._rhcr_h = min(self._rhcr_window, self._rhcr_h + 1)
+                        self._show(f"RHCR W={self._rhcr_window} H={self._rhcr_h}")
                     # F1-F8 to select agent
                     elif pygame.K_F1 <= k <= pygame.K_F8:
                         idx = k - pygame.K_F1
@@ -870,15 +1629,21 @@ class MAPFApp:
 
                 elif ev.type == pygame.MOUSEWHEEL:
                     mx, my = pygame.mouse.get_pos()
-                    if mx < self._grid_area_w():          # zoom only on grid area
+                    if mx < self._grid_area_w():          # zoom on grid area
                         old = self.cell
                         self.cell = max(CELL_MIN, min(CELL_MAX, self.cell + ev.y))
-                        # Zoom towards mouse
                         gx = (mx - self.cam_x) / old
                         gy = (my - self.cam_y) / old
                         self.cam_x = mx - gx * self.cell
                         self.cam_y = my - gy * self.cell
                         self._clamp_cam()
+                    else:                                  # scroll agent list
+                        top = getattr(self, '_agent_list_top', 9999)
+                        if my >= top:
+                            self._agent_list_scroll = max(
+                                0, min(len(self.agents) - 1,
+                                       self._agent_list_scroll - ev.y)
+                            )
 
                 elif ev.type == pygame.VIDEORESIZE:
                     self._screen_w = ev.w

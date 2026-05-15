@@ -114,4 +114,41 @@ def make_warehouse_large(w=200, h=100):
 
 write_map("warehouse_200x100", make_warehouse_large(200, 100))
 
+# ── 5. Benchmark Warehouse (MAPF 연구용 스타일) ───────────────────────────────
+def make_benchmark_warehouse(w=33, h=33,
+                             shelf_h=2, shelf_w=4,
+                             h_aisle=2, v_aisle=2):
+    """
+    MAPF benchmark 스타일 창고 맵.
+    - 테두리 열림 (입출구)
+    - 가로 선반 + 가로 통로 반복
+    - 세로 통로가 선반을 규칙적으로 관통
+
+    shelf_h : 선반 높이 (셀)
+    shelf_w : 선반 블록 너비 (셀)
+    h_aisle : 가로 통로 높이 (셀)
+    v_aisle : 세로 통로 너비 (셀)
+    """
+    p = np.full((h, w), 255, dtype=np.uint8)   # 모두 free
+
+    r = h_aisle   # 첫 번째 선반 시작 행
+    while r + shelf_h <= h - h_aisle:
+        for sr in range(shelf_h):
+            row = r + sr
+            c = v_aisle   # 첫 번째 선반 시작 열
+            while c + shelf_w <= w - v_aisle:
+                # 선반 블록 채우기
+                p[row, c:c + shelf_w] = 0
+                c += shelf_w + v_aisle
+        r += shelf_h + h_aisle
+
+    return p
+
+# 33×33 기본
+write_map("benchmark_33x33", make_benchmark_warehouse(33, 33))
+
+# 65×65 대형
+write_map("benchmark_65x65", make_benchmark_warehouse(
+    65, 65, shelf_h=2, shelf_w=5, h_aisle=2, v_aisle=2))
+
 print("Done - maps/ folder ready.")

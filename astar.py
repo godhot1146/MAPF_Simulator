@@ -5,20 +5,31 @@ def manhattan(a, b):
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
 
+def _reconstruct(state, came_from, start):
+    path = []
+    s = state
+    while s in came_from:
+        path.append((s[0], s[1]))
+        s = came_from[s]
+    path.append(start)
+    path.reverse()
+    return path
+
+
 def astar(grid, start, goal, vertex_constraints=None, edge_constraints=None,
-          max_time=300, safe_positions=None):
+          max_time=300, safe_positions=None, partial_path=False):
     """
     Space-time A* with CBS constraints and optional body-clearance.
 
-    safe_positions : precomputed set of (c, r) that have enough obstacle clearance
-                     for the agent's physical radius. If None, all free cells are valid.
+    safe_positions : precomputed set of (c, r) with enough obstacle clearance.
+    partial_path   : if True and goal unreachable within max_time, return the
+                     path to the cell closest to goal that was reached.
     """
     if vertex_constraints is None:
         vertex_constraints = set()
     if edge_constraints is None:
         edge_constraints = set()
 
-    # Positions the agent may actually visit
     def is_valid(c, r):
         if safe_positions is not None:
             return (c, r) in safe_positions
@@ -27,15 +38,17 @@ def astar(grid, start, goal, vertex_constraints=None, edge_constraints=None,
     if not is_valid(*start) or not is_valid(*goal):
         return None
 
-    # Earliest time we can safely stay at goal
     goal_free_from = 0
     for vc, vr, vt in vertex_constraints:
         if (vc, vr) == goal:
             goal_free_from = max(goal_free_from, vt + 1)
 
     open_heap = [(manhattan(start, goal), 0, start[0], start[1], 0)]
-    g_map = {(start[0], start[1], 0): 0}
+    g_map     = {(start[0], start[1], 0): 0}
     came_from = {}
+
+    best_partial_state = None
+    best_partial_dist  = float("inf")
 
     while open_heap:
         f, g, c, r, t = heapq.heappop(open_heap)
@@ -44,15 +57,15 @@ def astar(grid, start, goal, vertex_constraints=None, edge_constraints=None,
         if g > g_map.get(state, float("inf")):
             continue
 
+        # Track closest-to-goal node for partial path fallback
+        if partial_path and (c, r) != goal:
+            d = manhattan((c, r), goal)
+            if d < best_partial_dist:
+                best_partial_dist  = d
+                best_partial_state = state
+
         if (c, r) == goal and t >= goal_free_from:
-            path = []
-            s = state
-            while s in came_from:
-                path.append((s[0], s[1]))
-                s = came_from[s]
-            path.append(start)
-            path.reverse()
-            return path
+            return _reconstruct(state, came_from, start)
 
         if t >= max_time:
             continue
@@ -71,6 +84,11 @@ def astar(grid, start, goal, vertex_constraints=None, edge_constraints=None,
             if ng < g_map.get(nstate, float("inf")):
                 g_map[nstate] = ng
                 came_from[nstate] = state
-                heapq.heappush(open_heap, (ng + manhattan((nc, nr), goal), ng, nc, nr, nt))
+                heapq.heappush(open_heap,
+                               (ng + manhattan((nc, nr), goal), ng, nc, nr, nt))
+
+    # Search exhausted — return partial path if requested
+    if partial_path and best_partial_state is not None:
+        return _reconstruct(best_partial_state, came_from, start)
 
     return None

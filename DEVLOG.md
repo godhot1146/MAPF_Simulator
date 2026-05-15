@@ -201,8 +201,121 @@ v1 기반에서 확장성·연속 운용 기능 추가. 에이전트 99대, Auto
 
 ### 다음 과제 (아이디어)
 
-- [ ] RHCR (Rolling Horizon Collision Resolution) — 주기적 윈도우 기반 CBS
+- [x] RHCR (Rolling Horizon Collision Resolution) → v3에서 구현
 - [ ] ORCA / 속도 장애물 기반 실시간 충돌 회피
 - [ ] 통계 패널 — makespan, SOC, 충돌 횟수, 도착 횟수/초
 - [ ] 시나리오 저장/불러오기 (에이전트 위치 포함 YAML)
 - [ ] ECBS (Enhanced CBS) — 충돌 우선순위 기반 탐색 효율 향상
+
+---
+
+## 2026-05-15 (v3 개발 — RHCR)
+
+### 개요
+
+RHCR(Rolling Horizon Collision Resolution) 구현 및 Auto Mode 버튼 구조 개편.
+CBS 내부 버그 수정, A\* 부분 경로(partial path) 지원 추가.
+
+---
+
+### 구현 내용
+
+#### 1. RHCR (Rolling Horizon Collision Resolution)
+
+**개념**
+
+| 파라미터 | 의미 |
+|---|---|
+| W (window) | CBS가 충돌을 감지하는 시간 범위 (스텝 수) |
+| H (horizon) | 실제 실행 후 재계획하는 주기 (H ≤ W) |
+
+동작 흐름:
+1. CBS 실행 — 전체 경로 계획, 단 충돌 감지는 W 스텝 내로 제한
+2. H 스텝 실행 (로봇 이동)
+3. H 스텝 완료 → CBS 재발동 (현재 위치에서)
+4. CBS 계산 중 로봇 동결 (순간이동 방지)
+5. CBS 결과 적용 → 반복
+
+**핵심 설계 결정**
+
+- A\*는 최종 목적지까지 전체 경로 탐색 (`max_time=300` 유지)
+- CBS 충돌 감지만 W 스텝으로 제한 → 탐색 공간 유지, CBS fail 방지
+- W 스텝 클리핑 ❌ (→ 중간 웨이포인트에 로봇 집중 → t=0 충돌 → no_solution 유발)
+- 이전 CBS가 보장한 위치에서 재출발하므로 다음 CBS도 해가 존재함이 이론적으로 보장
+
+**구현 파일**
+
+- `astar.py`: `partial_path` 파라미터 추가 — W 내 목적지 미도달 시 최근접 위치까지 경로 반환
+- `cbs.py`: `horizon` 파라미터 추가 — `detect_first_conflict`를 W 스텝으로 제한
+- `simulator.py`: `_rhcr_window` (W 기본값 12), `_rhcr_h` (H 기본값 5) 추가
+
+#### 2. Auto Mode 버튼 구조 개편
+
+기존: `[Auto Mode]` + `[Replan: A*/CBS/RHCR]` 2개 버튼 (토글 방식)
+
+개편: 직관적인 3개 독립 버튼
+
+| 버튼 | 키 | 동작 |
+|---|---|---|
+| `Auto: A*` | `a` | 개별 A\* 재계획 모드 |
+| `Auto: CBS` | `b` | CBS 라운드트립 모드 |
+| `Auto: RHCR` | `h` | 윈도우 기반 CBS 재계획 |
+
+- 같은 버튼 재클릭 → 정지
+- 다른 버튼 클릭 → 모드 전환 후 재시작
+
+#### 3. 버그 수정
+
+| 버그 | 원인 | 해결 |
+|---|---|---|
+| CBS replan fail 빈번 | 수동 SOLVE 취소 후 `stop_event`가 set 상태로 남음 → Auto CBS가 즉시 종료 | `_cont_replan_cbs_all()` 진입 시 `stop_event.clear()` 추가 |
+| 홀딩 로봇 통과 | A\* 폴백에서 frozen 에이전트를 `t+1` 한 스텝만 제약 | frozen 에이전트를 `horizon`(30) 스텝 전체에 정적 장애물로 처리 |
+| RHCR 스터터 (뒤로 튀기) | CBS 결과 적용 시 `local_t=0` 리셋이 소수점 위치를 정수로 스냅 | CBS 발동 직전 `local_t = int(local_t)`로 스냅해 점프 제거 |
+
+#### 4. RHCR 파라미터 조작
+
+| 키 | 동작 |
+|---|---|
+| `[` | W 감소 (−5, 최소 H) |
+| `]` | W 증가 (+5, 최대 200) |
+| `,` | H 감소 (−1, 최소 1) |
+| `.` | H 증가 (+1, 최대 W) |
+
+하단 stat bar에 `RHCR W=12 H=5 nxt:3.2steps` 실시간 표시.
+
+---
+
+### 알게 된 것 (v3)
+
+**RHCR의 핵심은 W와 H의 분리**
+- W = 계획 지평선 (CBS가 앞을 내다보는 범위)
+- H = 실행 지평선 (재계획 주기, H ≤ W)
+- W > H이면 "멀리 보고, 자주 갱신" → 데드락 예방 + 반응성 확보
+
+**경로 클리핑의 함정**
+- 직관적으로 "W 스텝만큼 잘라서 쓰면 된다"고 생각하기 쉬움
+- 실제로는 클리핑된 경로 끝점에 로봇이 집중 → 다음 CBS에서 t=0 충돌 → no_solution
+- 올바른 방법: A\*는 전체 탐색, 충돌 감지만 W 스텝 제한
+
+**CBS 실패 원인 분류**
+
+| 메시지 | 원인 | 대응 |
+|---|---|---|
+| `node_limit` | max_nodes 부족 | Max nodes 증가 |
+| `no_solution` | 맵 토폴로지/에이전트 밀도 문제 | 에이전트 수 줄이기 또는 큰 맵 사용 |
+| `cancelled` | stop_event 잔류 | (버그 수정됨) |
+
+**RHCR 적용 한계 (33x33 벤치마크 기준)**
+- 에이전트 20대 + radius 0.5: CBS가 종종 no_solution 반환
+- 원인: 통로 특성상 복잡한 교차 상황에서 W=12 내 해가 없는 경우 발생
+- 권장: 10~12대 이하 또는 65x65 맵 사용
+
+---
+
+### 다음 과제 (아이디어)
+
+- [ ] ORCA / 속도 장애물 기반 실시간 충돌 회피 (비교 대상으로)
+- [ ] RHCR 성능 지표 — makespan, SOC, throughput 비교 그래프
+- [ ] CBS no_solution 발생 시 우선 해결 전략 (에이전트 일시 정지 등)
+- [ ] ECBS (Enhanced CBS) — 충돌 우선순위 기반 탐색 효율 향상
+- [ ] 시나리오 저장/불러오기 (에이전트 위치 포함 YAML)

@@ -60,18 +60,17 @@ def _dist(c1, r1, c2, r2):
     return math.sqrt((c1 - c2) ** 2 + (r1 - r2) ** 2)
 
 
-def detect_first_conflict(paths, agent_radius=0.5):
+def detect_first_conflict(paths, agent_radius=0.5, horizon=None):
     """
     Find the first conflict considering the agent's physical size.
 
-    Two agents conflict (vertex) at time t when the Euclidean distance
-    between their positions is less than 2 * agent_radius.
-
-    Edge conflict: standard position-swap at consecutive timesteps.
+    horizon : if set, only check timesteps 0..horizon (RHCR window limit).
     """
     conflict_dist = 2.0 * agent_radius
     aids = list(paths.keys())
     max_t = max(len(p) for p in paths.values())
+    if horizon is not None:
+        max_t = min(max_t, horizon + 1)
 
     for t in range(max_t):
         # Gather positions
@@ -127,7 +126,7 @@ class CBSNode:
 # ── CBS solver ─────────────────────────────────────────────────────────────────
 
 def solve_cbs(grid, agents, max_time=300, agent_radius=0.5,
-              stop_event=None, progress=None, max_nodes=None):
+              stop_event=None, progress=None, max_nodes=None, horizon=None):
     """
     agents       : list of {'start': (col, row), 'goal': (col, row)}
     agent_radius : physical radius in cells
@@ -167,6 +166,11 @@ def solve_cbs(grid, agents, max_time=300, agent_radius=0.5,
         progress['nodes']        = nodes_expanded
         progress['open_size']    = len(open_list)
 
+    # For RHCR horizon: A* still plans full paths (keeps search space large so
+    # CBS can resolve conflicts). Only conflict *detection* is limited to horizon.
+    astar_max_time = max_time
+    astar_partial  = False
+
     safe_pos = compute_safe_positions(grid, agent_radius)
     if cancelled():
         return None
@@ -182,7 +186,7 @@ def solve_cbs(grid, agents, max_time=300, agent_radius=0.5,
             agents[i]["start"], agents[i]["goal"],
             root.constraints[i]["v"],
             root.constraints[i]["e"],
-            max_time,
+            astar_max_time,
             safe_pos,
         )
         if path is None:
@@ -220,7 +224,7 @@ def solve_cbs(grid, agents, max_time=300, agent_radius=0.5,
                 progress['terminated'] = 'node_limit'
             return None
 
-        conflict = detect_first_conflict(node.paths, agent_radius)
+        conflict = detect_first_conflict(node.paths, agent_radius, horizon=horizon)
         push_progress(node.paths, conflict)
 
         if conflict is None:
@@ -253,7 +257,7 @@ def solve_cbs(grid, agents, max_time=300, agent_radius=0.5,
                 agents[agent]["start"], agents[agent]["goal"],
                 child.constraints[agent]["v"],
                 child.constraints[agent]["e"],
-                max_time,
+                astar_max_time,
                 safe_pos,
             )
             if path is None:
