@@ -306,9 +306,38 @@ CBS 내부 버그 수정, A\* 부분 경로(partial path) 지원 추가.
 | `cancelled` | stop_event 잔류 | (버그 수정됨) |
 
 **RHCR 적용 한계 (33x33 벤치마크 기준)**
-- 에이전트 20대 + radius 0.5: CBS가 종종 no_solution 반환
-- 원인: 통로 특성상 복잡한 교차 상황에서 W=12 내 해가 없는 경우 발생
-- 권장: 10~12대 이하 또는 65x65 맵 사용
+- 에이전트 20대 + radius 0.5: edge constraint 버그 수정 전까지 no_solution 빈발 → 수정 후 크게 개선됨
+- 권장: 65x65 맵 또는 에이전트 수 조정
+
+---
+
+### 치명적 버그 수정 — CBS edge constraint off-by-1
+
+**처음 커밋부터 존재한 버그.** swap 충돌 방지 명령이 실제로 A\*에 전혀 적용되지 않았음.
+
+#### 원인
+
+CBS가 t=5에서 A↔B 자리 바꾸기(swap) 충돌을 감지하면, A에게 제약을 줌:
+
+```
+CBS가 추가한 제약:  (c1,r1 → c2,r2, time=5)   ← 도착 시점
+A* 가 확인하는 것:  (c1,r1 → c2,r2, time=4)   ← 출발 시점
+```
+
+`5 ≠ 4` → 제약이 무시됨 → A\*가 똑같은 충돌 경로 반환 → CBS 중복 감지 → 자식 노드 0개 → **`no_solution nodes=1`**
+
+#### 수정 (`cbs.py`)
+
+```python
+dep_t = conflict.time - 1   # 출발 시점 = 도착 시점 - 1
+child.constraints[agent]["e"].add((c1, r1, c2, r2, dep_t))
+```
+
+#### 영향
+
+- swap 충돌이 정상적으로 해결됨
+- Auto RHCR · Auto CBS 안정성 대폭 향상
+- `no_solution nodes=1` 거의 사라짐
 
 ---
 
@@ -316,6 +345,5 @@ CBS 내부 버그 수정, A\* 부분 경로(partial path) 지원 추가.
 
 - [ ] ORCA / 속도 장애물 기반 실시간 충돌 회피 (비교 대상으로)
 - [ ] RHCR 성능 지표 — makespan, SOC, throughput 비교 그래프
-- [ ] CBS no_solution 발생 시 우선 해결 전략 (에이전트 일시 정지 등)
 - [ ] ECBS (Enhanced CBS) — 충돌 우선순위 기반 탐색 효율 향상
 - [ ] 시나리오 저장/불러오기 (에이전트 위치 포함 YAML)

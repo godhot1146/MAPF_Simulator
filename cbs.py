@@ -242,13 +242,17 @@ def solve_cbs(grid, agents, max_time=300, agent_radius=0.5,
                     (conflict.col, conflict.row, conflict.time)
                 )
             else:
+                # Edge constraint uses DEPARTURE time (= conflict.time - 1)
+                # because A* checks (from_c, from_r, to_c, to_r, t) where t
+                # is the time the agent LEAVES from_c,from_r, not when it arrives.
+                dep_t = conflict.time - 1
                 if agent == conflict.a1:
                     child.constraints[agent]["e"].add(
-                        (conflict.c1, conflict.r1, conflict.c2, conflict.r2, conflict.time)
+                        (conflict.c1, conflict.r1, conflict.c2, conflict.r2, dep_t)
                     )
                 else:
                     child.constraints[agent]["e"].add(
-                        (conflict.c2, conflict.r2, conflict.c1, conflict.r1, conflict.time)
+                        (conflict.c2, conflict.r2, conflict.c1, conflict.r1, dep_t)
                     )
 
             child.paths = dict(node.paths)
