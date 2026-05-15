@@ -1159,13 +1159,35 @@ class MAPFApp:
             step   = min(int(local_t), len(path) - 1)
             frac   = local_t - int(local_t)
 
-            # Remaining path (dim line)
+            thick_w = max(2, cell // 4)
+
+            # RHCR: thick up to W steps (conflict-guaranteed), thin beyond
+            # CBS round-trip: all thick. A*: all thin.
+            if self._cont_replan_mode == 2:
+                guaranteed_end = self._rhcr_window   # fixed at CBS-planned W steps
+            elif self._cont_replan_mode == 1:
+                guaranteed_end = len(path)
+            else:
+                guaranteed_end = len(path)  # A*: show full path, thin
+
+            draw_thick_end = min(guaranteed_end, len(path) - 1)
+
+            # Thin line: full remaining path (all modes)
             for j in range(step, len(path) - 1):
                 x0 = int(path[j][0]   * cell + cell/2 + self.cam_x)
                 y0 = int(path[j][1]   * cell + cell/2 + self.cam_y)
                 x1 = int(path[j+1][0] * cell + cell/2 + self.cam_x)
                 y1 = int(path[j+1][1] * cell + cell/2 + self.cam_y)
                 pygame.draw.line(self.screen, dim, (x0, y0), (x1, y1), 1)
+
+            # Thick line: CBS/RHCR guaranteed range on top
+            if self._cont_replan_mode in (1, 2):
+                for j in range(step, draw_thick_end):
+                    x0 = int(path[j][0]   * cell + cell/2 + self.cam_x)
+                    y0 = int(path[j][1]   * cell + cell/2 + self.cam_y)
+                    x1 = int(path[j+1][0] * cell + cell/2 + self.cam_x)
+                    y1 = int(path[j+1][1] * cell + cell/2 + self.cam_y)
+                    pygame.draw.line(self.screen, dim, (x0, y0), (x1, y1), thick_w)
 
             # Goal marker
             gc, gr = ca["goal"]
@@ -1258,6 +1280,7 @@ class MAPFApp:
     def _draw_paths(self):
         if not self.paths:
             return
+        line_w = max(2, self.cell // 4)   # CBS-solved: always thick
         for i, path in self.paths.items():
             color = agent_color(i)
             dim   = tuple(max(0, v - 80) for v in color)
@@ -1271,7 +1294,7 @@ class MAPFApp:
                 cy0 = y0 + self.cell // 2
                 cx1 = x1 + self.cell // 2
                 cy1 = y1 + self.cell // 2
-                pygame.draw.line(self.screen, dim, (cx0, cy0), (cx1, cy1), max(1, self.cell // 6))
+                pygame.draw.line(self.screen, dim, (cx0, cy0), (cx1, cy1), line_w)
 
     def _draw_agents(self):
         cell   = self.cell
