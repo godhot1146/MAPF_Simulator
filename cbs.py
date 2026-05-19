@@ -125,8 +125,22 @@ class CBSNode:
 
 # ── CBS solver ─────────────────────────────────────────────────────────────────
 
+def _expand_path(path, time_per_cell):
+    """Expand A* path to explicit-timestep form for slow robots.
+    Each actual move is padded with (time_per_cell-1) transit steps at source."""
+    if time_per_cell <= 1:
+        return path
+    expanded = []
+    for i, pos in enumerate(path):
+        expanded.append(pos)
+        if i < len(path) - 1 and path[i + 1] != pos:   # actual move
+            expanded.extend([pos] * (time_per_cell - 1))
+    return expanded
+
+
 def solve_cbs(grid, agents, max_time=300, agent_radius=0.5,
-              stop_event=None, progress=None, max_nodes=None, horizon=None):
+              stop_event=None, progress=None, max_nodes=None, horizon=None,
+              time_per_cell=None):
     """
     agents       : list of {'start': (col, row), 'goal': (col, row)}
     agent_radius : physical radius in cells
@@ -166,10 +180,12 @@ def solve_cbs(grid, agents, max_time=300, agent_radius=0.5,
         progress['nodes']        = nodes_expanded
         progress['open_size']    = len(open_list)
 
-    # For RHCR horizon: A* still plans full paths (keeps search space large so
-    # CBS can resolve conflicts). Only conflict *detection* is limited to horizon.
     astar_max_time = max_time
     astar_partial  = False
+
+    # time_per_cell per agent (1 = normal, 2 = half speed, etc.)
+    n = len(agents)
+    tpc = list(time_per_cell) if time_per_cell else [1] * n
 
     safe_pos = compute_safe_positions(grid, agent_radius)
     if cancelled():
@@ -188,10 +204,11 @@ def solve_cbs(grid, agents, max_time=300, agent_radius=0.5,
             root.constraints[i]["e"],
             astar_max_time,
             safe_pos,
+            time_per_cell=tpc[i],
         )
         if path is None:
             return None
-        root.paths[i] = path
+        root.paths[i] = _expand_path(path, tpc[i])
 
     root.cost = sum(len(p) for p in root.paths.values())
     open_list = [root]
@@ -263,11 +280,12 @@ def solve_cbs(grid, agents, max_time=300, agent_radius=0.5,
                 child.constraints[agent]["e"],
                 astar_max_time,
                 safe_pos,
+                time_per_cell=tpc[agent],
             )
             if path is None:
                 continue
 
-            child.paths[agent] = path
+            child.paths[agent] = _expand_path(path, tpc[agent])
             child.cost = sum(len(p) for p in child.paths.values())
             heapq.heappush(open_list, child)
 

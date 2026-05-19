@@ -18,6 +18,7 @@ def load_config():
 
 if __name__ == "__main__":
     os.makedirs("maps", exist_ok=True)
+    os.environ.setdefault("SDL_VIDEO_CENTERED", "1")
 
     parser = argparse.ArgumentParser(description="MAPF Simulator (CBS)")
     parser.add_argument("--cols", type=int, default=None,         help="Grid width in cells")
