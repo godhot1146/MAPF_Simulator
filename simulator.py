@@ -19,6 +19,8 @@ BTN_NORMAL    = (62,  68,  98)
 BTN_HOVER     = (80,  88,  128)
 BTN_ACTIVE    = (95,  108, 170)
 MSG_BG        = (0,   0,   0,  190)
+FORBID_CELL   = (180, 40,  40)
+SPEED_CELL    = (255, 180, 50)
 
 import colorsys as _colorsys
 
@@ -33,12 +35,15 @@ def agent_color(idx):
 SIDEBAR_W   = 225
 CELL_DEFAULT      =  8
 SOLVE_TIMEOUT_DEFAULT = 30.0
-CELL_MIN     =  8
+CELL_MIN     =  1
 CELL_MAX     = 40
+BASE_SPEED   = 2.0   # m/s at tpc=1 (max speed)
 
 MODE_OBS   = "obstacle"
 MODE_ERASE = "erase"
 MODE_AGNT  = "agent"
+MODE_FORBID = "forbidden"
+MODE_SPEED  = "speed_zone"
 
 SUB_NONE  = 0
 SUB_START = 1
@@ -98,7 +103,7 @@ class MAPFApp:
         self.sim_step     = 0
         self.sim_run      = False
         c = cfg or {}
-        self.sim_speed    = float(c.get("sim_speed",    5.0))
+        self.sim_speed    = float(c.get("sim_speed",    1.0))
         self.agent_radius = float(c.get("agent_radius", 1.5))
 
         self._solving       = False
@@ -110,6 +115,9 @@ class MAPFApp:
         self.max_nodes      = int(c.get("max_nodes", 5000))
         self._cbs_progress  = {}
         self._show_progress = True     # toggle with Tab
+
+        self._zone_speed_tpc   = 3     # default tpc for speed zones
+        self._grid_cache       = None
 
         self._drag_painting    = False
         self._drag_val         = True
@@ -169,6 +177,7 @@ class MAPFApp:
         self._astar_pending  = {}    # {idx: goal} waiting to be replanned
         self._astar_running  = False # batch worker in progress
         self._astar_results  = {}    # {idx: new_path} from worker
+        self._astar_inflight = set() # agent indices currently being planned
 
         self.font   = pygame.font.SysFont("consolas", 13)
         self.font_s = pygame.font.SysFont("consolas", 11)
@@ -177,9 +186,10 @@ class MAPFApp:
 
         self._screen_w = self.grid.width * self.cell + SIDEBAR_W
         self._screen_h = max(self.grid.height * self.cell, 520)
-        self.screen = pygame.display.set_mode(
-            (self._screen_w, self._screen_h), pygame.RESIZABLE
-        )
+        info = pygame.display.Info()
+        sw = min(self._screen_w, info.current_w - 40)
+        sh = min(self._screen_h, info.current_h - 80)
+        self.screen = pygame.display.set_mode((sw, sh), pygame.RESIZABLE)
 
         self.clock  = pygame.time.Clock()
         self._btns  = []
@@ -208,13 +218,24 @@ class MAPFApp:
         def B(rect, label, cb, toggle=False):
             return Btn(rect, label, cb, toggle)
 
-        self.b_obs   = B((x0,      y, hw, h), "Draw",   lambda: self._set_mode(MODE_OBS),   True)
-        self.b_era   = B((x0+hw+4, y, hw, h), "Erase",  lambda: self._set_mode(MODE_ERASE), True); y += h+g
-        self.b_agnt  = B((x0, y, w,      h), "Agent",   lambda: self._set_mode(MODE_AGNT), True); y += h+g*2
+        # ── Draw Tools ────────────────────────────────────────────────
+        self._y_draw_label = y;                                                                  y += 14+g
+        self.b_obs    = B((x0, y, w, h), "Wall",       lambda: self._set_mode(MODE_OBS),    True); y += h+g
+        self.b_forbid = B((x0, y, w, h), "Forbidden",  lambda: self._set_mode(MODE_FORBID), True); y += h+g
+        self.b_speed  = B((x0, y, w, h), "Slow Zone",  lambda: self._set_mode(MODE_SPEED),  True); y += h+g
+        self._y_slow_tpc = y;                                                                        y += 18+g
+        self.b_era    = B((x0, y, w, h), "Erase",      lambda: self._set_mode(MODE_ERASE),  True); y += h+g
+
+        # ── Agent Tools ──────────────────────────────────────────────
+        self._y_agent_label = y;                                                                 y += 14+g
+        self.b_agnt  = B((x0, y, w,      h), "Agent",   lambda: self._set_mode(MODE_AGNT), True); y += h+g
         self.b_add   = B((x0,       y, hw, h), "+Agent",        self._add_agent)
         self.b_del   = B((x0+hw+4,  y, hw, h), "-Agent",        self._del_agent); y += h+g
         self.b_start = B((x0,       y, hw, h), "Set Start",  self._toggle_start, True)
         self.b_goal  = B((x0+hw+4,  y, hw, h), "Set Goal",   self._toggle_goal,  True); y += h+g*2
+
+        # ── Parameters ───────────────────────────────────────────────
+        self._y_param_label = y;                                                                 y += 14+g
         # Agent radius control  (label 14px + bar 10px + gap)
         self._y_radius = y;                                                                 y += 30+g
         # Sim speed control   (label 14px + bar 10px + gap)
@@ -223,7 +244,8 @@ class MAPFApp:
         y += 18
         # Max-nodes row       (label 14px + gap)
         y += 18+g
-        # ── Lifelong MAPF section label
+
+        # ── Lifelong MAPF ────────────────────────────────────────────
         self._y_lifelong_label = y;                                                             y += 14+g
         self.b_auto_astar = B((x0, y, w, h), "Auto: A*",   lambda: self._start_auto(0), True); y += h+g
         self.b_auto_cbs   = B((x0, y, w, h), "Auto: CBS",  lambda: self._start_auto(1), True); y += h+g
@@ -231,10 +253,14 @@ class MAPFApp:
         self._y_rhcr_wh = y;                                                                        y += 18+18+g
         self.b_auto_pbs   = B((x0, y, w, h), "Auto: PBS",  lambda: self._start_auto(3), True); y += h+g
         self.b_auto_pibt  = B((x0, y, w, h), "Auto: PIBT", lambda: self._start_auto(4), True); y += h+g
-        # ── MAPF section label
+
+        # ── MAPF ─────────────────────────────────────────────────────
         self._y_mapf_label = y;                                                                 y += 14+g
         self.b_solve  = B((x0, y, w, h), "SOLVE CBS", self._solve_or_cancel);  y += h+g
         self.b_rsim   = B((x0, y, w, h), "Reset Sim", self._reset_sim);       y += h+g*2
+
+        # ── Map / Data ───────────────────────────────────────────────
+        self._y_map_label = y;                                                                   y += 14+g
         self.b_save  = B((x0,       y, hw, h), "Save Map", self._save_map)
         self.b_load  = B((x0+hw+4,  y, hw, h), "Load Map", self._load_map);                y += h+g
         self.b_new   = B((x0, y, w, h), "New Map...",     self._new_map);                  y += h+g
@@ -243,7 +269,7 @@ class MAPFApp:
         self.b_call  = B((x0, y, w, h), "Clear All",      self._clear_all)
 
         self._btns = [
-            self.b_obs, self.b_era, self.b_agnt,
+            self.b_obs, self.b_era, self.b_forbid, self.b_speed, self.b_agnt,
             self.b_add, self.b_del,
             self.b_start, self.b_goal,
             self.b_auto_astar, self.b_auto_cbs, self.b_auto_rhcr, self.b_auto_pbs, self.b_auto_pibt,
@@ -256,6 +282,8 @@ class MAPFApp:
     def _refresh_btn_state(self):
         self.b_obs.active      = (self.mode == MODE_OBS)
         self.b_era.active      = (self.mode == MODE_ERASE)
+        self.b_forbid.active   = (self.mode == MODE_FORBID)
+        self.b_speed.active    = (self.mode == MODE_SPEED)
         self.b_agnt.active     = (self.mode == MODE_AGNT)
         self.b_start.active    = (self.edit_sub == SUB_START)
         self.b_goal.active     = (self.edit_sub == SUB_GOAL)
@@ -346,6 +374,9 @@ class MAPFApp:
         # tasks/min = count in last 60s
         self._throughput = len(self._throughput_window)
 
+    def _time_scale(self):
+        return BASE_SPEED / self.grid.resolution
+
     def _show(self, msg, secs=3):
         self.msg       = msg
         self.msg_ticks = secs * 60
@@ -372,6 +403,23 @@ class MAPFApp:
         self.mode     = MODE_AGNT
         self._refresh_btn_state()
 
+    def _adjust_agent_speed(self, ai, direction):
+        """direction: +1 = faster (lower tpc), -1 = slower (higher tpc)"""
+        cur_tpc = self.agents[ai].get("tpc", 1)
+        new_tpc = cur_tpc - direction
+        new_tpc = max(1, min(200, new_tpc))
+        self.agents[ai]["tpc"] = new_tpc
+        if ai in self._cont_agents:
+            self._cont_agents[ai]["tpc"] = new_tpc
+        new_ms = BASE_SPEED / new_tpc
+        mt = max(2, self._max_tpc())
+        if self._rhcr_h < mt:
+            self._rhcr_h = mt
+            self._rhcr_window = max(self._rhcr_window, self._rhcr_h)
+            self._show(f"A{ai+1}: {new_ms:.3f}m/s  (H→{self._rhcr_h})")
+        else:
+            self._show(f"A{ai+1}: {new_ms:.3f}m/s")
+
     def _add_agent(self):
         if len(self.agents) >= MAX_AGENTS:
             self._show(f"Max {MAX_AGENTS} agents.")
@@ -392,6 +440,7 @@ class MAPFApp:
 
     def _add_or_remove_obstacle(self, c, r, placing):
         self.grid.set_obstacle(c, r, placing)
+        self._invalidate_grid_cache()
         # Remove agent markers that overlap
         for a in self.agents:
             if a["start"] == (c, r) and placing:
@@ -419,6 +468,18 @@ class MAPFApp:
             self._box_start     = (c, r)
             self._box_cur       = (c, r)
 
+        elif self.mode == MODE_FORBID:
+            self._drag_painting = True
+            self._drag_val      = (btn == 1)
+            self._box_start     = (c, r)
+            self._box_cur       = (c, r)
+
+        elif self.mode == MODE_SPEED:
+            self._drag_painting = True
+            self._drag_val      = (btn == 1)
+            self._box_start     = (c, r)
+            self._box_cur       = (c, r)
+
         elif self.mode == MODE_AGNT:
             if not self.agents:
                 self._show("Add an agent first.")
@@ -426,8 +487,8 @@ class MAPFApp:
             agent = self.agents[self.sel]
 
             if self.edit_sub == SUB_START:
-                if self.grid.is_obstacle(c, r):
-                    self._show("Cannot place start on obstacle.")
+                if self.grid.is_obstacle(c, r) or (c, r) in self.grid.forbidden:
+                    self._show("Cannot place start on blocked cell.")
                     return
                 agent["start"] = (c, r)
                 self.edit_sub  = SUB_GOAL
@@ -435,8 +496,8 @@ class MAPFApp:
                 self._show("Start set – now click goal.")
 
             elif self.edit_sub == SUB_GOAL:
-                if self.grid.is_obstacle(c, r):
-                    self._show("Cannot place goal on obstacle.")
+                if self.grid.is_obstacle(c, r) or (c, r) in self.grid.forbidden:
+                    self._show("Cannot place goal on blocked cell.")
                     return
                 agent["goal"]  = (c, r)
                 self.edit_sub  = SUB_NONE
@@ -454,7 +515,7 @@ class MAPFApp:
         if not self._drag_painting:
             return
         gp = self._screen_to_grid(sx, sy)
-        if gp and self.mode in (MODE_OBS, MODE_ERASE):
+        if gp and self.mode in (MODE_OBS, MODE_ERASE, MODE_FORBID, MODE_SPEED):
             self._box_cur = gp
 
     def _apply_box(self):
@@ -465,9 +526,25 @@ class MAPFApp:
         c1, r1 = self._box_cur
         for r in range(min(r0, r1), max(r0, r1) + 1):
             for c in range(min(c0, c1), max(c0, c1) + 1):
-                self._add_or_remove_obstacle(c, r, self._drag_val)
+                if self.mode == MODE_FORBID:
+                    if self._drag_val:
+                        self.grid.forbidden.add((c, r))
+                        self.grid.obstacles.discard((c, r))
+                        self.grid.speed_zones.pop((c, r), None)
+                    else:
+                        self.grid.forbidden.discard((c, r))
+                elif self.mode == MODE_SPEED:
+                    if self._drag_val:
+                        self.grid.speed_zones[(c, r)] = self._zone_speed_tpc
+                        self.grid.obstacles.discard((c, r))
+                        self.grid.forbidden.discard((c, r))
+                    else:
+                        self.grid.speed_zones.pop((c, r), None)
+                else:
+                    self._add_or_remove_obstacle(c, r, self._drag_val)
         self._box_start = None
         self._box_cur   = None
+        self._invalidate_grid_cache()
 
     # ── CBS solve ─────────────────────────────────────────────────────────────
     def _solve(self):
@@ -601,10 +678,17 @@ class MAPFApp:
             if path:
                 grid, _ = Grid.from_pgm_yaml(path)
                 self.grid = grid
+                self._invalidate_grid_cache()
                 self._save_config(path)
                 self._reset_sim()
                 self._clamp_cam()
                 self._rebuild_btns()
+                sw = self.grid.width  * self.cell + SIDEBAR_W
+                sh = max(self.grid.height * self.cell, 520)
+                info = pygame.display.Info()
+                sw = min(sw, info.current_w - 40)
+                sh = min(sh, info.current_h - 80)
+                self.screen = pygame.display.set_mode((sw, sh), pygame.RESIZABLE)
                 self._show(f"Loaded: {os.path.basename(path)}")
         except Exception as e:
             self._show(f"Load error: {e}")
@@ -616,6 +700,9 @@ class MAPFApp:
 
     def _clear_all(self):
         self.grid   = Grid.empty(self.grid.width, self.grid.height)
+        self.grid.forbidden.clear()
+        self.grid.speed_zones.clear()
+        self._invalidate_grid_cache()
         self.agents = []
         self.sel    = 0
         self._reset_sim()
@@ -823,6 +910,7 @@ class MAPFApp:
             return
         batch = dict(self._astar_pending)
         self._astar_pending.clear()
+        self._astar_inflight.update(batch.keys())
         self._astar_running = True
 
         def worker():
@@ -883,6 +971,7 @@ class MAPFApp:
             return
         batch = dict(self._astar_pending)
         self._astar_pending.clear()
+        self._astar_inflight.update(batch.keys())
         self._astar_running = True
 
         def worker():
@@ -1061,9 +1150,9 @@ class MAPFApp:
             return
 
         tpc_input = simpledialog.askstring(
-            "Speed (스텝/칸)",
-            "숫자(1-10): 전체 동일 속도\n'r' 또는 빈칸: 전체 랜덤",
-            initialvalue="1"
+            "Speed (m/s)",
+            f"숫자(0.01~2.00 m/s): 전체 동일 속도\n'r' 또는 빈칸: 전체 랜덤",
+            initialvalue="1.00"
         )
         root.destroy()
 
@@ -1072,9 +1161,10 @@ class MAPFApp:
             tpc_mode = "random"
         else:
             try:
-                tpc_fixed = max(1, min(10, int(tpc_input)))
+                ms_val = max(0.01, min(2.0, float(tpc_input)))
+                tpc_fixed = max(1, round(BASE_SPEED / ms_val))
                 tpc_mode = "fixed"
-            except ValueError:
+            except (ValueError, ZeroDivisionError):
                 tpc_mode = "random"
 
         from cbs import compute_safe_positions
@@ -1108,7 +1198,8 @@ class MAPFApp:
             if tpc_mode == "fixed":
                 spd_tpc = tpc_fixed
             else:
-                spd_tpc = random.randint(1, 10)
+                rand_ms = random.uniform(0.01, 2.0)
+                spd_tpc = max(1, round(BASE_SPEED / rand_ms))
             self.agents.append({"start": starts[i], "goal": goals[i], "tpc": spd_tpc})
             added += 1
 
@@ -1130,10 +1221,13 @@ class MAPFApp:
             dlg.grab_set()
 
             fields = {}
+            res_def = self.grid.resolution
+            w_m_def = round(self.grid.width * res_def, 2)
+            h_m_def = round(self.grid.height * res_def, 2)
             defaults = [
-                ("Columns (cells)", self.grid.width),
-                ("Rows    (cells)", self.grid.height),
-                ("Cell size (px)",  self.cell),
+                ("Resolution (m/cell)", res_def),
+                ("Width  (m)",          w_m_def),
+                ("Height (m)",          h_m_def),
             ]
             for row_i, (label, default) in enumerate(defaults):
                 tk.Label(dlg, text=label, anchor="w", width=18).grid(
@@ -1143,22 +1237,43 @@ class MAPFApp:
                     row=row_i, column=1, padx=10, pady=6)
                 fields[label] = var
 
+            # Live preview label
+            preview_var = tk.StringVar()
+            tk.Label(dlg, textvariable=preview_var, fg="gray").grid(
+                row=3, column=0, columnspan=2, padx=10)
+
+            def update_preview(*_):
+                try:
+                    r = float(fields["Resolution (m/cell)"].get())
+                    wm = float(fields["Width  (m)"].get())
+                    hm = float(fields["Height (m)"].get())
+                    preview_var.set(f"{int(wm/r)} x {int(hm/r)} cells")
+                except (ValueError, ZeroDivisionError):
+                    preview_var.set("")
+
+            for v in fields.values():
+                v.trace_add("write", update_preview)
+            update_preview()
+
             result = {}
 
             def ok():
                 try:
-                    result["cols"] = max(4,  min(200, int(fields["Columns (cells)"].get())))
-                    result["rows"] = max(4,  min(200, int(fields["Rows    (cells)"].get())))
-                    result["cell"] = max(CELL_MIN, min(CELL_MAX, int(fields["Cell size (px)"].get())))
+                    res = max(0.01, min(10.0, float(fields["Resolution (m/cell)"].get())))
+                    w_m = max(res * 4, min(100.0, float(fields["Width  (m)"].get())))
+                    h_m = max(res * 4, min(100.0, float(fields["Height (m)"].get())))
+                    result["cols"] = max(4, int(w_m / res))
+                    result["rows"] = max(4, int(h_m / res))
+                    result["resolution"] = res
                     dlg.destroy()
-                except ValueError:
+                except (ValueError, ZeroDivisionError):
                     pass
 
             def cancel():
                 dlg.destroy()
 
-            tk.Button(dlg, text="OK",     command=ok,     width=8).grid(row=3, column=0, pady=10)
-            tk.Button(dlg, text="Cancel", command=cancel, width=8).grid(row=3, column=1, pady=10)
+            tk.Button(dlg, text="OK",     command=ok,     width=8).grid(row=4, column=0, pady=10)
+            tk.Button(dlg, text="Cancel", command=cancel, width=8).grid(row=4, column=1, pady=10)
             dlg.bind("<Return>", lambda _: ok())
             dlg.bind("<Escape>", lambda _: cancel())
 
@@ -1167,7 +1282,7 @@ class MAPFApp:
 
             if result:
                 self.grid   = Grid.empty(result["cols"], result["rows"])
-                self.cell   = result["cell"]
+                self.grid.resolution = result["resolution"]
                 self.agents = []
                 self.sel    = 0
                 self.cam_x  = 0
@@ -1176,8 +1291,13 @@ class MAPFApp:
                 self._rebuild_btns()
                 sw = self.grid.width  * self.cell + SIDEBAR_W
                 sh = max(self.grid.height * self.cell, 520)
+                info = pygame.display.Info()
+                sw = min(sw, info.current_w - 40)
+                sh = min(sh, info.current_h - 80)
                 self.screen = pygame.display.set_mode((sw, sh), pygame.RESIZABLE)
-                self._show(f"New map: {result['cols']}x{result['rows']}, cell={result['cell']}px")
+                w_m = result['cols'] * result['resolution']
+                h_m = result['rows'] * result['resolution']
+                self._show(f"New map: {result['cols']}x{result['rows']} ({w_m:.1f}x{h_m:.1f}m, {result['resolution']}m/cell)")
         except Exception as e:
             self._show(f"Error: {e}")
 
@@ -1232,7 +1352,7 @@ class MAPFApp:
 
         if self.sim_run and self.paths:
             max_steps = max(len(p) for p in self.paths.values())
-            self.sim_t    += dt * self.sim_speed
+            self.sim_t    += dt * self.sim_speed * self._time_scale()
             self.sim_step  = int(self.sim_t)
             if self.sim_step >= max_steps:
                 self.sim_step = max_steps - 1
@@ -1246,6 +1366,8 @@ class MAPFApp:
                     if idx in self._cont_agents:
                         self._cont_agents[idx]["path"]    = new_path
                         self._cont_agents[idx]["local_t"] = 0.0
+                        self._cont_agents[idx]["goal"]    = new_path[-1]
+                    self._astar_inflight.discard(idx)
                 self._astar_results = {}
                 if self._astar_pending:
                     self._launch_astar_batch()
@@ -1290,7 +1412,7 @@ class MAPFApp:
                     at_goal = (int(ca["local_t"]) >= len(path) - 1
                                and path[-1] == ca["goal"])
                     if not at_goal:
-                        ca["local_t"] += dt * self.sim_speed
+                        ca["local_t"] += dt * self.sim_speed * self._time_scale()
 
                 all_at_goal = all(
                     int(ca["local_t"]) >= len(ca["path"]) - 1
@@ -1314,13 +1436,13 @@ class MAPFApp:
             elif self._cont_replan_mode == 2:
                 # ── RHCR: freeze during CBS, then replan every W steps ────────
                 if not self._cont_cbs_run:
-                    self._rhcr_global_t += dt * self.sim_speed
+                    self._rhcr_global_t += dt * self.sim_speed * self._time_scale()
 
                     # Advance agents; clamp at end of path
                     for idx, ca in self._cont_agents.items():
                         path = ca["path"]
                         if int(ca["local_t"]) < len(path) - 1:
-                            ca["local_t"] += dt * self.sim_speed
+                            ca["local_t"] += dt * self.sim_speed * self._time_scale()
                         else:
                             ca["local_t"] = float(len(path) - 1)
 
@@ -1355,7 +1477,7 @@ class MAPFApp:
                         at_goal = (int(ca["local_t"]) >= len(path) - 1
                                    and path[-1] == ca["goal"])
                         if not at_goal:
-                            ca["local_t"] += dt * self.sim_speed
+                            ca["local_t"] += dt * self.sim_speed * self._time_scale()
 
                     all_at_goal = all(
                         int(ca["local_t"]) >= len(ca["path"]) - 1
@@ -1379,7 +1501,7 @@ class MAPFApp:
             elif self._cont_replan_mode == 4:
                 # ── PIBT: one cell per step, priority inheritance ─────────────
                 from pibt import pibt_step, manhattan as mb_manhattan
-                self._pibt_frac += dt * self.sim_speed
+                self._pibt_frac += dt * self.sim_speed * self._time_scale()
                 if self._pibt_frac >= 1.0:
                     self._pibt_frac -= 1.0
                     # Arrival check
@@ -1458,10 +1580,10 @@ class MAPFApp:
                     at_goal = (int(ca["local_t"]) >= len(path) - 1
                                and path[-1] == ca["goal"])
                     if not at_goal:
-                        ca["local_t"] += dt * self.sim_speed / max(1, ca.get("tpc", 1))
+                        ca["local_t"] += dt * self.sim_speed * self._time_scale() / max(1, ca.get("tpc", 1))
 
                 for idx, ca in self._cont_agents.items():
-                    if idx in self._astar_pending:
+                    if idx in self._astar_pending or idx in self._astar_inflight:
                         continue
                     path = ca["path"]
                     at_end = int(ca["local_t"]) >= len(path) - 1
@@ -1579,21 +1701,35 @@ class MAPFApp:
                     y1 = int(path[j+1][1] * cell + cell/2 + self.cam_y)
                     pygame.draw.line(self.screen, dim, (x0, y0), (x1, y1), thick_w)
 
-            # Goal marker
-            gc, gr = ca["goal"]
+            # Goal marker — use path destination to stay in sync
+            gc, gr = path[-1] if path else ca["goal"]
             gx = int(gc * cell + cell/2 + self.cam_x)
             gy = int(gr * cell + cell/2 + self.cam_y)
             s  = max(3, cell // 3)
             pygame.draw.rect(self.screen, color, (gx-s, gy-s, s*2, s*2), 2)
 
-            # Interpolated agent position
+            # Interpolated agent position — find the actual move span
+            c0, r0 = path[step]
             if step < len(path) - 1:
-                c0, r0 = path[step]
-                c1, r1 = path[step + 1]
-                sx = (c0 + (c1 - c0) * frac) * cell + cell/2 + self.cam_x
-                sy = (r0 + (r1 - r0) * frac) * cell + cell/2 + self.cam_y
+                # Find start of current transit (first occurrence of this pos)
+                transit_start = step
+                while transit_start > 0 and path[transit_start - 1] == (c0, r0):
+                    transit_start -= 1
+                # Find end of transit (next different pos)
+                transit_end = step + 1
+                while transit_end < len(path) and path[transit_end] == (c0, r0):
+                    transit_end += 1
+                if transit_end < len(path):
+                    c1, r1 = path[transit_end]
+                    transit_len = transit_end - transit_start
+                    progress = (local_t - transit_start) / max(1, transit_len)
+                    progress = max(0.0, min(1.0, progress))
+                    sx = (c0 + (c1 - c0) * progress) * cell + cell/2 + self.cam_x
+                    sy = (r0 + (r1 - r0) * progress) * cell + cell/2 + self.cam_y
+                else:
+                    sx = c0 * cell + cell/2 + self.cam_x
+                    sy = r0 * cell + cell/2 + self.cam_y
             else:
-                c0, r0 = path[step]
                 sx = c0 * cell + cell/2 + self.cam_x
                 sy = r0 * cell + cell/2 + self.cam_y
 
@@ -1648,7 +1784,12 @@ class MAPFApp:
         y0 = int(min(r0, r1) * self.cell + self.cam_y)
         w  = (abs(c1 - c0) + 1) * self.cell
         h  = (abs(r1 - r0) + 1) * self.cell
-        color = (80, 80, 80) if self._drag_val else (200, 120, 60)
+        if self.mode == MODE_FORBID:
+            color = FORBID_CELL if self._drag_val else (200, 120, 60)
+        elif self.mode == MODE_SPEED:
+            color = SPEED_CELL if self._drag_val else (200, 120, 60)
+        else:
+            color = (80, 80, 80) if self._drag_val else (200, 120, 60)
         s = pygame.Surface((w, h), pygame.SRCALPHA)
         s.fill((*color, 80))
         self.screen.blit(s, (x0, y0))
@@ -1740,34 +1881,53 @@ class MAPFApp:
             t_lbl = self.font_s.render(f"t={ct}", True, (255, 200, 80))
             self.screen.blit(t_lbl, (cx + max(4, cell) + 3, cy - 6))
 
-    def _draw_grid(self):
-        surf  = self.screen
-        cell  = self.cell
-        cam_x = self.cam_x
-        cam_y = self.cam_y
-        ga_w  = self._grid_area_w()
-        ga_h  = self.screen.get_height()
+    def _invalidate_grid_cache(self):
+        self._grid_cache = None
 
-        # Only draw cells visible on screen
-        c0 = max(0, int(-cam_x / cell))
-        r0 = max(0, int(-cam_y / cell))
-        c1 = min(self.grid.width,  int((ga_w - cam_x) / cell) + 1)
-        r1 = min(self.grid.height, int((ga_h - cam_y) / cell) + 1)
+    def _build_grid_cache(self):
+        cell = self.cell
+        w = self.grid.width * cell
+        h = self.grid.height * cell
+        surf = pygame.Surface((w, h))
+        surf.fill(FREE_CELL)
 
-        for r in range(r0, r1):
-            for c in range(c0, c1):
-                x = int(c * cell + cam_x)
-                y = int(r * cell + cam_y)
-                color = OBS_CELL if self.grid.is_obstacle(c, r) else FREE_CELL
-                pygame.draw.rect(surf, color, (x, y, cell, cell))
+        for c, r in self.grid.obstacles:
+            surf.fill(OBS_CELL, (c * cell, r * cell, cell, cell))
+        for c, r in self.grid.forbidden:
+            surf.fill(FORBID_CELL, (c * cell, r * cell, cell, cell))
+        for (c, r) in self.grid.speed_zones:
+            surf.fill(SPEED_CELL, (c * cell, r * cell, cell, cell))
 
         # Grid lines
-        for c in range(c0, c1 + 1):
-            lx = int(c * cell + cam_x)
-            pygame.draw.line(surf, GRID_LINE, (lx, 0), (lx, ga_h))
-        for r in range(r0, r1 + 1):
-            ly = int(r * cell + cam_y)
-            pygame.draw.line(surf, GRID_LINE, (0, ly), (ga_w, ly))
+        if cell >= 3:
+            for c in range(self.grid.width + 1):
+                pygame.draw.line(surf, GRID_LINE, (c * cell, 0), (c * cell, h))
+            for r in range(self.grid.height + 1):
+                pygame.draw.line(surf, GRID_LINE, (0, r * cell), (w, r * cell))
+
+        self._grid_cache = surf
+        self._grid_cache_cell = cell
+
+    def _draw_grid(self):
+        if (self._grid_cache is None or
+                getattr(self, '_grid_cache_cell', None) != self.cell):
+            self._build_grid_cache()
+
+        ga_w = self._grid_area_w()
+        ga_h = self.screen.get_height()
+        cx = int(self.cam_x)
+        cy = int(self.cam_y)
+
+        # source rect on the cache surface
+        sx = max(0, -cx)
+        sy = max(0, -cy)
+        # destination on screen
+        dx = max(0, cx)
+        dy = max(0, cy)
+        sw = min(self._grid_cache.get_width() - sx, ga_w - dx)
+        sh = min(self._grid_cache.get_height() - sy, ga_h - dy)
+        if sw > 0 and sh > 0:
+            self.screen.blit(self._grid_cache, (dx, dy), (sx, sy, sw, sh))
 
     def _draw_paths(self):
         if not self.paths:
@@ -1869,6 +2029,13 @@ class MAPFApp:
         t = self.font_b.render("MAPF  Simulator", True, TEXT)
         self.screen.blit(t, (x0 + 8, 8))
 
+        # Map size in meters
+        res = self.grid.resolution
+        map_w_m = self.grid.width * res
+        map_h_m = self.grid.height * res
+        sz = self.font_s.render(f"{map_w_m:.1f}x{map_h_m:.1f}m  ({self.grid.width}x{self.grid.height}cell  {res}m/cell)", True, DIM)
+        self.screen.blit(sz, (x0 + 8, 22))
+
         # Buttons
         for b in self._btns:
             b.draw(self.screen, self.font_s)
@@ -1879,17 +2046,21 @@ class MAPFApp:
 
         # Radius bar
         ry = self._y_radius
-        self.screen.blit(self.font_s.render(f"Radius: {self.agent_radius:.1f}  L/R click", True, DIM), (x0+8, ry))
-        r_min, r_max = 0.5, 4.0
-        filled_r = int(bar_w * (self.agent_radius - r_min) / (r_max - r_min))
+        res = self.grid.resolution
+        radius_m = self.agent_radius * res
+        diam_m   = radius_m * 2
+        self.screen.blit(self.font_s.render(f"R:{radius_m:.2f}m  D:{diam_m:.2f}m  (click)", True, DIM), (x0+8, ry))
+        r_max_cell = 10.0 / self.grid.resolution
+        r_min, r_max = 0.5, r_max_cell
+        filled_r = int(bar_w * (self.agent_radius - r_min) / max(1, r_max - r_min))
         pygame.draw.rect(self.screen, (55, 55, 70),   (x0+8, ry+13, bar_w, 8), border_radius=4)
         pygame.draw.rect(self.screen, (180, 120, 60), (x0+8, ry+13, filled_r, 8), border_radius=4)
         self._rect_radius_bar = pygame.Rect(x0+8, ry, bar_w, 22)
 
         # Speed bar
         sy = self._y_speed
-        self.screen.blit(self.font_s.render(f"Speed: {self.sim_speed:.1f}x  scroll", True, DIM), (x0+8, sy))
-        filled = int(bar_w * (self.sim_speed - 0.5) / 19.5)
+        self.screen.blit(self.font_s.render(f"Sim: {self.sim_speed:.1f}x realtime", True, DIM), (x0+8, sy))
+        filled = int(bar_w * (self.sim_speed - 0.1) / 4.9)
         pygame.draw.rect(self.screen, (55, 55, 70), (x0+8, sy+13, bar_w, 8), border_radius=4)
         pygame.draw.rect(self.screen, BTN_ACTIVE,   (x0+8, sy+13, filled, 8), border_radius=4)
 
@@ -1930,7 +2101,8 @@ class MAPFApp:
         self.screen.blit(self.font_s.render(header, True, DIM), (x0+8, ay))
         ay += 14
         self._agent_list_top = ay   # store for scroll hit-test
-        self._agent_speed_rects = {}  # {agent_idx: pygame.Rect} for speed click
+        self._agent_speed_minus = {}
+        self._agent_speed_plus = {}
 
         for slot in range(visible):
             i = self._agent_list_scroll + slot
@@ -1948,16 +2120,31 @@ class MAPFApp:
             g_s = f"({a['goal'][0]},{a['goal'][1]})"   if a["goal"]  else "?"
             spd = a.get("tpc", 1)
 
-            # TPC button (clickable, steps-per-cell)
-            spd_num  = self.font_s.render(f"{spd}", True, (255, 200, 80))
-            spd_unit = self.font_kr.render("(스텝/칸)", True, (255, 200, 80))
-            spd_w = spd_num.get_width() + spd_unit.get_width() + 8
-            spd_x = x0 + SIDEBAR_W - spd_w - 8
-            spd_rect = pygame.Rect(spd_x, ry, spd_w, row_h - 1)
-            pygame.draw.rect(self.screen, (60, 55, 35), spd_rect, border_radius=3)
-            self.screen.blit(spd_num,  (spd_x + 3, ry + 1))
-            self.screen.blit(spd_unit, (spd_x + 3 + spd_num.get_width() + 1, ry + 2))
-            self._agent_speed_rects[i] = spd_rect
+            # Speed display with +/- buttons
+            ms = BASE_SPEED / spd
+            bw = 14
+            spd_txt = self.font_s.render(f"{ms:.2f}m/s", True, (255, 200, 80))
+            txt_w = spd_txt.get_width()
+            total_w = bw + 4 + txt_w + 4 + bw
+            spd_x = x0 + SIDEBAR_W - total_w - 8
+
+            # - button
+            minus_r = pygame.Rect(spd_x, ry, bw, row_h - 1)
+            hov_m = minus_r.collidepoint(pygame.mouse.get_pos())
+            pygame.draw.rect(self.screen, BTN_HOVER if hov_m else (60, 55, 35), minus_r, border_radius=2)
+            self.screen.blit(self.font_s.render("-", True, (255, 200, 80)), (minus_r.x + 4, ry))
+
+            # speed text
+            self.screen.blit(spd_txt, (spd_x + bw + 4, ry + 1))
+
+            # + button
+            plus_r = pygame.Rect(spd_x + bw + 4 + txt_w + 4, ry, bw, row_h - 1)
+            hov_p = plus_r.collidepoint(pygame.mouse.get_pos())
+            pygame.draw.rect(self.screen, BTN_HOVER if hov_p else (60, 55, 35), plus_r, border_radius=2)
+            self.screen.blit(self.font_s.render("+", True, (255, 200, 80)), (plus_r.x + 3, ry))
+
+            self._agent_speed_minus[i] = minus_r
+            self._agent_speed_plus[i] = plus_r
 
             arr = self._cont_agents.get(i, {}).get("arrivals", 0) if self._cont_mode else 0
             arr_s = f" :{arr}" if self._cont_mode else ""
@@ -1976,10 +2163,21 @@ class MAPFApp:
             pygame.draw.rect(self.screen, (100, 100, 130), (bar_x, thumb_y, 4, thumb_h), border_radius=2)
 
         # Section labels
-        lbl_ll = self.font_s.render("── Lifelong MAPF ──", True, (120, 180, 120))
-        self.screen.blit(lbl_ll, (x0 + 8, self._y_lifelong_label))
-        lbl_mf = self.font_s.render("── MAPF ──", True, (180, 140, 100))
-        self.screen.blit(lbl_mf, (x0 + 8, self._y_mapf_label))
+        for attr, text, col in [
+            ('_y_draw_label',     '── Draw ──',           (140, 160, 200)),
+            ('_y_agent_label',    '── Agent ──',          (140, 200, 160)),
+            ('_y_param_label',    '── Parameters ──',     (180, 180, 140)),
+            ('_y_lifelong_label', '── Lifelong MAPF ──',  (120, 180, 120)),
+            ('_y_mapf_label',     '── MAPF ──',           (180, 140, 100)),
+            ('_y_map_label',      '── Map / Data ──',     (160, 150, 180)),
+        ]:
+            lbl = self.font_s.render(text, True, col)
+            self.screen.blit(lbl, (x0 + 8, getattr(self, attr)))
+
+        # Slow Zone speed row
+        self._draw_adj_row(x0, self._y_slow_tpc, bar_w,
+                           f"Slow: {BASE_SPEED / self._zone_speed_tpc:.2f} m/s",
+                           '_rect_zone_tpc_minus', '_rect_zone_tpc_plus')
 
         # SOLVE 버튼 라벨 동적 변경
         self.b_solve.label = "CANCEL" if self._solving else "SOLVE CBS"
@@ -2096,9 +2294,24 @@ class MAPFApp:
                 elif ev.type == pygame.MOUSEBUTTONDOWN:
                     # Radius bar: left=+0.5, right=-0.5
                     _r_bar = getattr(self, '_rect_radius_bar', None)
-                    if _r_bar and _r_bar.collidepoint(ev.pos) and ev.button in (1, 3):
-                        delta_r = +0.5 if ev.button == 1 else -0.5
-                        self.agent_radius = round(max(0.5, min(4.0, self.agent_radius + delta_r)), 1)
+                    if _r_bar and _r_bar.collidepoint(ev.pos) and ev.button == 1:
+                        try:
+                            import tkinter as _tk
+                            from tkinter import simpledialog as _sd
+                            _root = _tk.Tk(); _root.withdraw()
+                            cur_m = self.agent_radius * self.grid.resolution
+                            val = _sd.askfloat(
+                                "Robot Radius",
+                                f"반지름 (m) 입력:\n현재: {cur_m:.3f}m (지름 {cur_m*2:.3f}m)",
+                                initialvalue=round(cur_m, 3),
+                                minvalue=0.01, maxvalue=10.0,
+                            )
+                            _root.destroy()
+                            if val is not None:
+                                self.agent_radius = round(val / self.grid.resolution, 1)
+                                self.agent_radius = max(0.5, self.agent_radius)
+                        except Exception:
+                            pass
 
                     # Timeout / nodes / RHCR W / RHCR H mini-buttons
                     if ev.button == 1:
@@ -2121,31 +2334,26 @@ class MAPFApp:
                         for attr, delta in [('_rect_rhcr_h_minus', -1), ('_rect_rhcr_h_plus', +1)]:
                             r = getattr(self, attr, None)
                             if r and r.collidepoint(ev.pos):
-                                mt = self._max_tpc()
+                                mt = max(2, self._max_tpc())
                                 self._rhcr_h = max(mt, min(self._rhcr_window, self._rhcr_h + delta))
                                 self._rhcr_window = max(self._rhcr_window, self._rhcr_h)
-                    # TPC buttons in agent list (left=-1 faster, right=+1 slower)
+                        # Zone TPC buttons
+                        for attr, delta in [('_rect_zone_tpc_minus', -1), ('_rect_zone_tpc_plus', +1)]:
+                            r = getattr(self, attr, None)
+                            if r and r.collidepoint(ev.pos):
+                                self._zone_speed_tpc = max(2, min(200, self._zone_speed_tpc - delta))
+                    # Agent speed +/- buttons
                     _spd_clicked = False
-                    if ev.button in (1, 3):
-                        for _ai, _sr in getattr(self, '_agent_speed_rects', {}).items():
+                    if ev.button == 1:
+                        for _ai, _sr in self._agent_speed_minus.items():
                             if _sr.collidepoint(ev.pos):
-                                cur_tpc = self.agents[_ai].get("tpc", 1)
-                                delta = -1 if ev.button == 1 else +1
-                                new_tpc = max(1, min(10, cur_tpc + delta))
-                                self.agents[_ai]["tpc"] = new_tpc
-                                # Also sync cont_agents so RHCR/CBS picks up the change
-                                if _ai in self._cont_agents:
-                                    self._cont_agents[_ai]["tpc"] = new_tpc
-                                # H must be >= max tpc so slow robots complete ≥1 move per cycle
-                                mt = self._max_tpc()
-                                if self._rhcr_h < mt:
-                                    self._rhcr_h = mt
-                                    self._rhcr_window = max(self._rhcr_window, self._rhcr_h)
-                                    self._show(f"A{_ai+1}: {new_tpc} 스텝/칸  (H→{self._rhcr_h})")
-                                else:
-                                    self._show(f"A{_ai+1}: {new_tpc} 스텝/칸")
-                                _spd_clicked = True
-                                break
+                                self._adjust_agent_speed(_ai, -1)
+                                _spd_clicked = True; break
+                        if not _spd_clicked:
+                            for _ai, _sr in self._agent_speed_plus.items():
+                                if _sr.collidepoint(ev.pos):
+                                    self._adjust_agent_speed(_ai, +1)
+                                    _spd_clicked = True; break
                     # Sidebar buttons
                     handled = _spd_clicked or any(b.on_event(ev) for b in self._btns)
                     if not handled:
@@ -2194,7 +2402,7 @@ class MAPFApp:
                             )
                         else:                              # rest of sidebar → speed
                             self.sim_speed = round(
-                                max(0.5, min(20.0, self.sim_speed + ev.y * 0.5)), 1)
+                                max(0.1, min(5.0, self.sim_speed + ev.y * 0.1)), 1)
 
                 elif ev.type == pygame.VIDEORESIZE:
                     self._screen_w = ev.w

@@ -9,11 +9,25 @@ def _reconstruct(state, came_from, start):
     path = []
     s = state
     while s in came_from:
-        path.append((s[0], s[1]))
+        path.append((s[0], s[1], s[2]))
         s = came_from[s]
-    path.append(start)
+    path.append((start[0], start[1], 0))
     path.reverse()
     return path
+
+
+def expand_timed_path(timed_path):
+    """Convert A* timed path [(c,r,t),...] to per-timestep positions [(c,r),...]."""
+    if not timed_path:
+        return []
+    expanded = []
+    for i in range(len(timed_path) - 1):
+        c, r, t = timed_path[i]
+        _, _, nt = timed_path[i + 1]
+        for _ in range(nt - t):
+            expanded.append((c, r))
+    expanded.append((timed_path[-1][0], timed_path[-1][1]))
+    return expanded
 
 
 def astar(grid, start, goal, vertex_constraints=None, edge_constraints=None,
@@ -65,7 +79,8 @@ def astar(grid, start, goal, vertex_constraints=None, edge_constraints=None,
                 best_partial_state = state
 
         if (c, r) == goal and t >= goal_free_from:
-            return _reconstruct(state, came_from, start)
+            timed = _reconstruct(state, came_from, start)
+            return expand_timed_path(timed)
 
         if t >= max_time:
             continue
@@ -76,12 +91,13 @@ def astar(grid, start, goal, vertex_constraints=None, edge_constraints=None,
             if (nc, nr) == (c, r):
                 move_cost = 1          # wait: always 1 timestep
             else:
-                move_cost = time_per_cell  # move: time_per_cell timesteps
+                zone_tpc = grid.speed_zones.get((nc, nr), 1)
+                move_cost = max(time_per_cell, zone_tpc)
                 # Slow robot stays at source during transit — check those slots
-                if time_per_cell > 1:
+                if move_cost > 1:
                     transit_blocked = any(
                         (c, r, t + dt) in vertex_constraints
-                        for dt in range(1, time_per_cell)
+                        for dt in range(1, move_cost)
                     )
                     if transit_blocked:
                         continue
@@ -101,6 +117,7 @@ def astar(grid, start, goal, vertex_constraints=None, edge_constraints=None,
                                (ng + manhattan((nc, nr), goal), ng, nc, nr, nt))
 
     if partial_path and best_partial_state is not None:
-        return _reconstruct(best_partial_state, came_from, start)
+        timed = _reconstruct(best_partial_state, came_from, start)
+        return expand_timed_path(timed)
 
     return None

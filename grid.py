@@ -13,6 +13,9 @@ class Grid:
         self.width = width
         self.height = height
         self.obstacles = set()
+        self.forbidden = set()
+        self.speed_zones = {}  # {(c, r): max_speed_tpc} — minimum tpc required in zone
+        self.resolution = 0.05  # meters per cell
 
     def in_bounds(self, c, r):
         return 0 <= c < self.width and 0 <= r < self.height
@@ -23,7 +26,7 @@ class Grid:
         return (c, r) in self.obstacles
 
     def is_free(self, c, r):
-        return not self.is_obstacle(c, r)
+        return not self.is_obstacle(c, r) and (c, r) not in self.forbidden
 
     def set_obstacle(self, c, r, val):
         if not self.in_bounds(c, r):
@@ -70,6 +73,12 @@ class Grid:
                 if p < (1.0 - occupied_thresh):
                     grid.obstacles.add((c, r))
 
+        grid.resolution = meta.get("resolution", 0.05)
+        for entry in meta.get("forbidden", []):
+            grid.forbidden.add((int(entry[0]), int(entry[1])))
+        for entry in meta.get("speed_zones", []):
+            grid.speed_zones[(int(entry[0]), int(entry[1]))] = int(entry[2])
+
         return grid, meta
 
     def save_pgm_yaml(self, pgm_path, yaml_path=None, resolution=0.05):
@@ -86,12 +95,16 @@ class Grid:
         if HAS_YAML:
             meta = {
                 "image": os.path.basename(pgm_path),
-                "resolution": resolution,
+                "resolution": self.resolution,
                 "origin": [0.0, 0.0, 0.0],
                 "occupied_thresh": 0.65,
                 "free_thresh": 0.196,
                 "negate": 0,
             }
+            if self.forbidden:
+                meta["forbidden"] = [[c, r] for c, r in sorted(self.forbidden)]
+            if self.speed_zones:
+                meta["speed_zones"] = [[c, r, tpc] for (c, r), tpc in sorted(self.speed_zones.items())]
             with open(yaml_path, "w") as f:
                 yaml.dump(meta, f, default_flow_style=False)
 

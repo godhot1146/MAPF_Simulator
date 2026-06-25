@@ -24,7 +24,8 @@ def compute_safe_positions(grid, agent_radius):
             for dr in range(-r_ceil, r_ceil + 1):
                 for dc in range(-r_ceil, r_ceil + 1):
                     if math.sqrt(dc * dc + dr * dr) <= agent_radius:
-                        if grid.is_obstacle(col + dc, row + dr):
+                        nc, nr = col + dc, row + dr
+                        if grid.is_obstacle(nc, nr) or (nc, nr) in grid.forbidden:
                             ok = False
                             break
                 if not ok:
@@ -126,16 +127,8 @@ class CBSNode:
 # ── CBS solver ─────────────────────────────────────────────────────────────────
 
 def _expand_path(path, time_per_cell):
-    """Expand A* path to explicit-timestep form for slow robots.
-    Each actual move is padded with (time_per_cell-1) transit steps at source."""
-    if time_per_cell <= 1:
-        return path
-    expanded = []
-    for i, pos in enumerate(path):
-        expanded.append(pos)
-        if i < len(path) - 1 and path[i + 1] != pos:   # actual move
-            expanded.extend([pos] * (time_per_cell - 1))
-    return expanded
+    """No-op: A* now returns pre-expanded paths with per-cell timing."""
+    return path
 
 
 def solve_cbs(grid, agents, max_time=300, agent_radius=0.5,
