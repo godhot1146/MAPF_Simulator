@@ -1,10 +1,12 @@
 # MAPF Simulator
 
-Multi-Agent Path Finding simulator with CBS, Auto A*, and RHCR.
+Multi-Agent Path Finding simulator with CBS, PBS, PIBT, Auto A*, and RHCR.
 
-- **Algorithms**: CBS (manual solve) · Auto A* · Auto CBS · Auto RHCR
+- **Algorithms**: CBS (manual solve) · Auto A* · Auto CBS · Auto RHCR · Auto PBS · Auto PIBT
 - **Map format**: PGM + YAML (ROS map_server compatible)
 - **Collision model**: circular agent body — obstacle clearance + inter-agent distance
+- **Zone system**: Forbidden zones (no-go) · Speed-limit zones
+- **Units**: meters (m), m/s — resolution-based physical units
 - **Max agents**: 99
 
 ---
@@ -57,21 +59,16 @@ MAPF_Simulator/
 
 ## Controls
 
-### Edit Modes
+### Draw Tools (sidebar)
 
-| Key | Mode |
+| Button | Action |
 |---|---|
-| `1` | Draw obstacles |
-| `3` | Erase obstacles |
-| `2` | Agent edit |
-| `Esc` | Cancel action |
+| `Wall` | Draw obstacles (left-drag place, right-drag erase) |
+| `Forbidden` | Draw no-go zones (red) — robots cannot enter |
+| `Slow Zone` | Draw speed-limit zones (yellow) — robots forced to slow down |
+| `Erase` | Erase any zone/obstacle |
 
-### Obstacle / Erase (mode `1` / `3`)
-
-| Input | Action |
-|---|---|
-| Left-click / drag | Place obstacle |
-| Right-click / drag | Erase obstacle |
+All draw tools support **box drag** — drag a rectangle to fill/erase an area.
 
 ### Agent Edit (mode `2`)
 
@@ -117,7 +114,7 @@ Stat bar shows: `RHCR W=12 H=5 nxt:3.2steps`
 
 | Input | Action |
 |---|---|
-| Mouse wheel | Zoom in/out (8–40 px/cell) |
+| Mouse wheel | Zoom in/out (1–40 px/cell) |
 | Middle-button drag | Pan |
 
 ### Agent Body
@@ -133,7 +130,7 @@ Stat bar shows: `RHCR W=12 H=5 nxt:3.2steps`
 |---|---|
 | `Save Map` | Save grid as PGM+YAML |
 | `Load Map` | Load PGM+YAML map |
-| `New Map...` | Set cols × rows × cell size |
+| `New Map...` | Set width × height (m) + resolution (m/cell) |
 | `Clear Agents` | Remove all agents |
 | `Clear All` | Clear map and agents |
 
@@ -174,11 +171,14 @@ Flow: **CBS runs** (W-step conflict window) → **H steps executed** → **CBS r
 
 ## Agent Body & Collision
 
-Each agent has a configurable **radius** (cells, default 0.5).
+Each agent has a configurable **radius** (meters, click sidebar to input).
 
+- **Display**: `R:0.025m  D:0.050m` (radius + diameter in meters)
 - **Obstacle clearance**: A* only visits cells where all cells within `radius` are free.
+- **Forbidden zone clearance**: forbidden zones treated as impassable (same as obstacles).
 - **Inter-agent collision**: two agents conflict when distance < `2 × radius`.
-- **Visual**: agent circle drawn at `radius × cell_size` pixels.
+- **Speed**: each agent has individual speed (0.01–2.0 m/s), adjustable via `[-][+]` buttons.
+- **Speed-limit zones**: robots entering a slow zone are forced to minimum zone speed.
 
 ---
 

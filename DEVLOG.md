@@ -612,3 +612,134 @@ UI 전반 키보드 단축키 제거 및 마우스 중심으로 인터페이스 
 - [ ] tpc별 실제 처리량(throughput) 비교 실험
 - [ ] 혼합 속도 환경에서 최적 H, W 파라미터 탐색
 - [ ] 충돌 로그 CSV 내보내기
+
+---
+
+## 2026-06-25 (v6 개발 — Zone 시스템, m 단위 UI, 성능 최적화)
+
+### 개요
+
+금지 구역(Forbidden Zone)과 속도 제한 구역(Speed Zone) 추가.
+전체 UI를 m/s, m 단위로 전환. 그리드 렌더링 캐싱으로 대규모 맵 성능 개선.
+A* 성능 병목 확인 및 다음 단계(Cython 전환) 방향 설정.
+
+---
+
+### 구현 내용
+
+#### 1. Zone 시스템
+
+**금지 구역 (Forbidden Zone)**
+- `grid.forbidden` set으로 관리
+- `is_free()` 에서 forbidden 체크 → A*, CBS, PBS 모두 자동 적용
+- `compute_safe_positions()` 에서도 forbidden 제외
+- 랜덤 에이전트 배치 시 금지 구역에 start/goal 배치 방지
+- 시각화: 빨간색 셀
+
+**속도 제한 구역 (Speed Zone)**
+- `grid.speed_zones` dict `{(c,r): tpc}` 로 관리
+- A*에서 해당 셀 진입 시 `move_cost = max(robot_tpc, zone_tpc)` 적용
+- time-expanded path로 자동 반영 (CBS `_expand_path` 불필요)
+- 시각화: 노란색 셀
+
+**Zone I/O**
+- 맵 저장/로드 시 YAML에 `forbidden`, `speed_zones` 필드로 영속화
+
+#### 2. m 단위 UI 전환
+
+| 항목 | 이전 | 이후 |
+|---|---|---|
+| 맵 크기 | cells | `1.7x1.7m (33x33cell 0.05m/cell)` |
+| 로봇 반지름 | cells | `R:0.03m D:0.05m (click)` |
+| 로봇 속도 | tpc (스텝/칸) | `0.05 m/s` ([-][+] 버튼) |
+| Slow Zone | step/cell | `0.02 m/s` |
+| New Map | cells, px | `Width(m), Height(m), Resolution(m/cell)` + 실시간 셀 수 미리보기 |
+| Sim speed | `5.0x` | `1.0x realtime` |
+
+**속도 모델**: `BASE_SPEED = 2.0 m/s` (tpc=1 = 최고속). `speed = BASE_SPEED / tpc`.
+Resolution에 무관하게 일관된 속도 표시.
+
+**시간 동기화**: `_time_scale() = BASE_SPEED / resolution`. sim_speed 1.0x = 실시간.
+
+#### 3. 사이드바 섹션 구분
+
+| 섹션 | 버튼/컨트롤 |
+|---|---|
+| **Draw** | Wall, Forbidden, Slow Zone, Erase, Slow 속도 조절 |
+| **Agent** | Agent 모드, +/- Agent, Set Start/Goal |
+| **Parameters** | Radius (클릭 입력), Sim speed, Timeout, Max nodes |
+| **Lifelong MAPF** | Auto A\*, CBS, RHCR, PBS, PIBT, RHCR W/H |
+| **MAPF** | Solve CBS, Reset Sim |
+| **Map / Data** | Save/Load Map, New Map, Random Agents, Clear |
+
+#### 4. 성능 최적화
+
+**그리드 렌더링 캐싱**
+- 매 프레임 셀별 `pygame.draw.rect` → `Surface`에 한 번 렌더링 후 blit
+- 줌/맵 변경 시만 캐시 재생성 (`_invalidate_grid_cache()`)
+- 렌더링: 0.2ms/frame (200x200 맵 기준)
+
+**줌 아웃 한계 제거**: CELL_MIN 8→1, 대규모 맵 전체 조망 가능
+
+**창 자동 크기 조절**: 맵이 모니터보다 크면 자동으로 화면에 맞춤
+
+**그리드 라인 클리핑**: 맵 영역 안에서만 그리드 라인 표시
+
+#### 5. A* 보간 개선
+
+느린 로봇(tpc > 1)의 time-expanded path에서 같은 셀이 연속 반복될 때,
+전체 transit 구간에 걸쳐 부드럽게 보간하도록 수정.
+이전: 제자리 정지 → 순간 점프. 이후: 부드러운 슬라이딩.
+
+#### 6. 버그 수정
+
+| 버그 | 원인 | 해결 |
+|---|---|---|
+| A\* auto 목적지 이중 할당 | `_astar_pending` 배치 시작 시 clear → 가드 실패 | `_astar_inflight` set 추가, 결과 수신 시 제거 |
+| Goal 마커 위치 불일치 | `ca["goal"]` vs 실제 path 목적지 불일치 | goal 마커를 `path[-1]`로 표시, 결과 적용 시 goal 동기화 |
+| RHCR H < 2 시 로봇 미이동 | H=1이면 CBS가 1스텝 경로만 생성 | H 최소값 2로 제한 |
+| pygame.MAXIMIZED 미지원 | pygame 2.6.1에 해당 플래그 없음 | 모니터 크기 기준 clamp 방식으로 변경 |
+
+---
+
+### 성능 벤치마크 (200x200 빈 맵)
+
+| 항목 | 소요 시간 |
+|---|---|
+| A\* 단거리 (50셀) | 30ms |
+| A\* 중거리 (100셀) | 113ms |
+| A\* 장거리 (200셀 대각선) | **74초** |
+| CBS 2에이전트 단거리 | 113ms |
+| 그리드 캐시 생성 | 6ms |
+| 화면 렌더링 (blit) | 0.2ms/frame |
+
+**결론**: 병목은 렌더링이 아닌 **A\* 경로 계산**. Space-time A\*가 (x, y, t) 3차원 탐색이라
+맵 크기에 따라 탐색 공간이 폭발적으로 증가.
+
+---
+
+### 알게 된 것 (v6)
+
+**Zone과 A\*의 통합**
+- forbidden zone은 `is_free()` 레벨에서 차단 → 모든 알고리즘에 자동 적용
+- speed zone은 A\* `move_cost` 레벨에서 적용 → CBS expand 불필요 (A\*가 time-expanded path 직접 반환)
+
+**m 단위 전환의 핵심**
+- `resolution` (m/cell)이 모든 물리 단위의 기준
+- 로봇 속도는 resolution과 무관하게 `BASE_SPEED / tpc`로 표시
+- 시뮬레이션 시간 동기화: `time_scale = BASE_SPEED / resolution`
+
+**대규모 맵의 현실적 한계**
+- 2000x2000 셀 (100m × 0.05m) → Python A\*로 불가능
+- 해결 방향: A\*를 Cython/C로 전환 (50~100배 성능 향상 기대)
+- JPS(Jump Point Search) 또는 HPA\*(Hierarchical A\*) 도입 검토
+
+---
+
+### 다음 과제
+
+- [ ] **A\* Cython 전환** — 대규모 맵(2000x2000) 지원을 위한 필수 과제
+- [ ] JPS (Jump Point Search) 도입 — 빈 공간 탐색 최적화
+- [ ] max_time 자동 조절 — 맨해튼 거리 기반으로 불필요한 탐색 공간 제거
+- [ ] ECBS (Enhanced CBS) — 충돌 우선순위 기반 탐색 효율 향상
+- [ ] 웹 프론트엔드 분리 — 렌더링 GPU 가속 (대규모 맵 시각화)
