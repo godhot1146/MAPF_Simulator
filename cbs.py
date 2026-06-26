@@ -200,6 +200,11 @@ def solve_cbs(grid, agents, max_time=300, agent_radius=0.5,
             time_per_cell=tpc[i],
         )
         if path is None:
+            if progress is not None:
+                progress['failed_agent'] = i
+                progress['failed_start'] = list(agents[i]["start"])
+                progress['failed_goal'] = list(agents[i]["goal"])
+                progress['terminated'] = 'no_initial_path'
             return None
         root.paths[i] = _expand_path(path, tpc[i])
 
@@ -224,6 +229,8 @@ def solve_cbs(grid, agents, max_time=300, agent_radius=0.5,
         # Skip if we've already evaluated this exact combination of paths
         pk = paths_key(node.paths)
         if pk in seen_path_combos:
+            if progress is not None:
+                progress['skipped_dupes'] = progress.get('skipped_dupes', 0) + 1
             continue
         seen_path_combos.add(pk)
 
@@ -239,6 +246,19 @@ def solve_cbs(grid, agents, max_time=300, agent_radius=0.5,
 
         if conflict is None:
             return node.paths
+
+        if progress is not None:
+            if isinstance(conflict, VertexConflict):
+                progress['last_conflict'] = {
+                    'type': 'vertex', 'a1': conflict.a1, 'a2': conflict.a2,
+                    'pos': [conflict.col, conflict.row], 't': conflict.time
+                }
+            else:
+                progress['last_conflict'] = {
+                    'type': 'edge', 'a1': conflict.a1, 'a2': conflict.a2,
+                    'pos1': [conflict.c1, conflict.r1],
+                    'pos2': [conflict.c2, conflict.r2], 't': conflict.time
+                }
 
         for agent in [conflict.a1, conflict.a2]:
             if cancelled():
@@ -276,6 +296,12 @@ def solve_cbs(grid, agents, max_time=300, agent_radius=0.5,
                 time_per_cell=tpc[agent],
             )
             if path is None:
+                if progress is not None:
+                    progress['last_fail_agent'] = agent
+                    progress['last_fail_start'] = list(agents[agent]["start"])
+                    progress['last_fail_goal'] = list(agents[agent]["goal"])
+                    progress['last_fail_constraints_v'] = len(child.constraints[agent]["v"])
+                    progress['last_fail_constraints_e'] = len(child.constraints[agent]["e"])
                 continue
 
             child.paths[agent] = _expand_path(path, tpc[agent])
@@ -285,4 +311,6 @@ def solve_cbs(grid, agents, max_time=300, agent_radius=0.5,
     # Open list exhausted → definitively no solution
     if progress is not None:
         progress['terminated'] = 'no_solution'
+        progress['nodes'] = nodes_expanded
+        progress['seen_combos'] = len(seen_path_combos)
     return None

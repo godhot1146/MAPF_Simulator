@@ -15,7 +15,6 @@ def load_config():
             pass
     return {}
 
-
 if __name__ == "__main__":
     os.makedirs("maps", exist_ok=True)
     os.environ.setdefault("SDL_VIDEO_CENTERED", "1")
