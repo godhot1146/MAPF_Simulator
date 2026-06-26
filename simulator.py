@@ -52,13 +52,14 @@ SUB_GOAL  = 2
 
 # ── Tiny button helper ─────────────────────────────────────────────────────────
 class Btn:
-    def __init__(self, rect, label, cb, toggle=False):
+    def __init__(self, rect, label, cb, toggle=False, tip=None):
         self.rect   = pygame.Rect(rect)
         self.label  = label
         self.cb     = cb
         self.toggle = toggle
         self.active = False
         self._hover = False
+        self.tip    = tip
 
     def hit(self, pos):
         return self.rect.collidepoint(pos)
@@ -185,6 +186,11 @@ class MAPFApp:
         self._sim_log        = []    # buffered log entries
         self._sim_log_t0     = 0.0   # real-time start of sim
 
+        # ── A* visualization ──────────────────────────────────────────
+        self._astar_viz       = False  # toggle with V key
+        self._astar_viz_agents = {}    # {agent_idx: {(c,r): t}} per-agent expanded cells
+        self._astar_viz_total = 0
+
         self.font   = pygame.font.SysFont("consolas", 13)
         self.font_s = pygame.font.SysFont("consolas", 11)
         self.font_b = pygame.font.SysFont("consolas", 14, bold=True)
@@ -212,8 +218,26 @@ class MAPFApp:
             except Exception:
                 pass
 
+    TOOLBAR_H = 44
+
     # ── Button layout ──────────────────────────────────────────────────────────
     def _rebuild_btns(self):
+        # ── Top toolbar (frequently used) ────────────────────────────
+        th = self.TOOLBAR_H
+        tb_h = 24
+        tb_g = 4
+        tx = 4
+
+        def B(rect, label, cb, toggle=False, tip=None):
+            return Btn(rect, label, cb, toggle, tip)
+
+        self.b_obs    = B((tx, 4, 50, tb_h), "Wall",   lambda: self._set_mode(MODE_OBS),    True, tip="벽(장애물) 그리기"); tx += 54
+        self.b_forbid = B((tx, 4, 60, tb_h), "Forbid", lambda: self._set_mode(MODE_FORBID), True, tip="금지 구역"); tx += 64
+        self.b_speed  = B((tx, 4, 50, tb_h), "Slow",   lambda: self._set_mode(MODE_SPEED),  True, tip="감속 구역"); tx += 54
+        self.b_era    = B((tx, 4, 50, tb_h), "Erase",  lambda: self._set_mode(MODE_ERASE),  True, tip="지우기"); tx += 58
+        self.b_viz    = B((tx, 4, 50, tb_h), "A*Viz",  self._toggle_astar_viz, True, tip="A* 탐색 시각화 (V키)"); tx += 54
+
+        # ── Sidebar ──────────────────────────────────────────────────
         x0 = self._grid_area_w() + 8
         w  = SIDEBAR_W - 16
         hw = w // 2 - 2
@@ -221,67 +245,59 @@ class MAPFApp:
         g  = 5
         y  = 32
 
-        def B(rect, label, cb, toggle=False):
-            return Btn(rect, label, cb, toggle)
-
-        # ── Draw Tools ────────────────────────────────────────────────
-        self._y_draw_label = y;                                                                  y += 14+g
-        self.b_obs    = B((x0, y, w, h), "Wall",       lambda: self._set_mode(MODE_OBS),    True); y += h+g
-        self.b_forbid = B((x0, y, w, h), "Forbidden",  lambda: self._set_mode(MODE_FORBID), True); y += h+g
-        self.b_speed  = B((x0, y, w, h), "Slow Zone",  lambda: self._set_mode(MODE_SPEED),  True); y += h+g
-        self._y_slow_tpc = y;                                                                        y += 18+g
-        self.b_era    = B((x0, y, w, h), "Erase",      lambda: self._set_mode(MODE_ERASE),  True); y += h+g
-
-        # ── Agent Tools ──────────────────────────────────────────────
+        # ── Agent ────────────────────────────────────────────────────
         self._y_agent_label = y;                                                                 y += 14+g
-        self.b_agnt  = B((x0, y, w,      h), "Agent",   lambda: self._set_mode(MODE_AGNT), True); y += h+g
-        self.b_add   = B((x0,       y, hw, h), "+Agent",        self._add_agent)
-        self.b_del   = B((x0+hw+4,  y, hw, h), "-Agent",        self._del_agent); y += h+g
-        self.b_start = B((x0,       y, hw, h), "Set Start",  self._toggle_start, True)
-        self.b_goal  = B((x0+hw+4,  y, hw, h), "Set Goal",   self._toggle_goal,  True); y += h+g*2
+        self.b_agnt  = B((x0, y, w, h), "Select Agent", lambda: self._set_mode(MODE_AGNT), True); y += h+g
+        self.b_add   = B((x0,       y, hw, h), "+Agent",    self._add_agent)
+        self.b_del   = B((x0+hw+4,  y, hw, h), "-Agent",    self._del_agent); y += h+g
+        self.b_start = B((x0,       y, hw, h), "Set Start", self._toggle_start, True)
+        self.b_goal  = B((x0+hw+4,  y, hw, h), "Set Goal",  self._toggle_goal,  True); y += h+g
+        self.b_rand  = B((x0, y, w, h), "Random Agents",    self._random_agents); y += h+g*2
 
         # ── Parameters ───────────────────────────────────────────────
         self._y_param_label = y;                                                                 y += 14+g
-        # Agent radius control  (label 14px + bar 10px + gap)
         self._y_radius = y;                                                                 y += 30+g
-        # Sim speed control   (label 14px + bar 10px + gap)
         self._y_speed = y;                                                                  y += 30+g
-        # Timeout row         (label 14px + gap)
-        y += 18
-        # Max-nodes row       (label 14px + gap)
-        y += 18+g
+        self._y_slow_tpc = y;                                                               y += 18+g
+        y += 18  # Timeout row
+        y += 18+g  # Max-nodes row
 
-        # ── Lifelong MAPF ────────────────────────────────────────────
-        self._y_lifelong_label = y;                                                             y += 14+g
-        self.b_auto_astar = B((x0, y, w, h), "Auto: A*",   lambda: self._start_auto(0), True); y += h+g
-        self.b_auto_cbs   = B((x0, y, w, h), "Auto: CBS",  lambda: self._start_auto(1), True); y += h+g
-        self.b_auto_rhcr  = B((x0, y, w, h), "Auto: RHCR", lambda: self._start_auto(2), True); y += h+g
+        indent = 16
+
+        # ── Research (comparison) ────────────────────────────────────
+        self._y_research_label = y;                                                             y += 14+g
+        self.b_auto_cbs   = B((x0, y, w, h), "CBS",  lambda: self._start_auto(1), True); y += h+g
+        self.b_auto_rhcr  = B((x0+indent, y, w-indent, h), "RHCR", lambda: self._start_auto(2), True); y += h+g
         self._y_rhcr_wh = y;                                                                        y += 18+18+g
-        self.b_auto_pbs   = B((x0, y, w, h), "Auto: PBS",  lambda: self._start_auto(3), True); y += h+g
-        self.b_auto_pibt  = B((x0, y, w, h), "Auto: PIBT", lambda: self._start_auto(4), True); y += h+g
+        self.b_auto_pbs   = B((x0, y, w, h), "PBS",  lambda: self._start_auto(3), True); y += h+g
+        self.b_solve  = B((x0, y, w, h), "SOLVE CBS", self._solve_or_cancel); y += h+g*2
 
-        # ── MAPF ─────────────────────────────────────────────────────
-        self._y_mapf_label = y;                                                                 y += 14+g
-        self.b_solve  = B((x0, y, w, h), "SOLVE CBS", self._solve_or_cancel);  y += h+g
-        self.b_rsim   = B((x0, y, w, h), "Reset Sim", self._reset_sim);       y += h+g*2
+        # ── Realtime ─────────────────────────────────────────────────
+        self._y_realtime_label = y;                                                             y += 14+g
+        self.b_auto_pibt  = B((x0, y, w, h), "PIBT", lambda: self._start_auto(4), True); y += h+g*2
+
+        # ── Production ───────────────────────────────────────────────
+        self._y_production_label = y;                                                           y += 14+g
+        self.b_auto_astar = B((x0, y, w, h), "A* + Reservation", lambda: self._start_auto(0), True); y += h+g
+
 
         # ── Map / Data ───────────────────────────────────────────────
         self._y_map_label = y;                                                                   y += 14+g
         self.b_save  = B((x0,       y, hw, h), "Save Map", self._save_map)
         self.b_load  = B((x0+hw+4,  y, hw, h), "Load Map", self._load_map);                y += h+g
         self.b_new   = B((x0, y, w, h), "New Map...",     self._new_map);                  y += h+g
-        self.b_rand  = B((x0, y, w, h), "Random Agents",  self._random_agents);             y += h+g
         self.b_clag  = B((x0, y, w, h), "Clear Agents",   self._clear_agents);             y += h+g
         self.b_call  = B((x0, y, w, h), "Clear All",      self._clear_all)
 
         self._btns = [
-            self.b_obs, self.b_era, self.b_forbid, self.b_speed, self.b_agnt,
-            self.b_add, self.b_del,
-            self.b_start, self.b_goal,
+            # Toolbar
+            self.b_obs, self.b_era, self.b_forbid, self.b_speed, self.b_viz,
+            # Sidebar - Agent
+            self.b_agnt, self.b_add, self.b_del, self.b_start, self.b_goal, self.b_rand,
             self.b_auto_astar, self.b_auto_cbs, self.b_auto_rhcr, self.b_auto_pbs, self.b_auto_pibt,
-            self.b_solve, self.b_rsim,
+            self.b_solve,
             self.b_save, self.b_load,
-            self.b_new, self.b_rand, self.b_clag, self.b_call,
+            self.b_new, self.b_clag, self.b_call,
         ]
         self._refresh_btn_state()
 
@@ -293,6 +309,7 @@ class MAPFApp:
         self.b_agnt.active     = (self.mode == MODE_AGNT)
         self.b_start.active    = (self.edit_sub == SUB_START)
         self.b_goal.active     = (self.edit_sub == SUB_GOAL)
+        self.b_viz.active        = self._astar_viz
         self.b_auto_astar.active = self._cont_mode and self._cont_replan_mode == 0
         self.b_auto_cbs.active   = self._cont_mode and self._cont_replan_mode == 1
         self.b_auto_rhcr.active  = self._cont_mode and self._cont_replan_mode == 2
@@ -408,6 +425,40 @@ class MAPFApp:
             self._show(f"Log saved: {len(self._sim_log)} entries")
         except Exception:
             pass
+
+    def _toggle_astar_viz(self):
+        if self._astar_viz:
+            self._astar_viz = False
+            self._astar_viz_agents = {}
+        else:
+            self._astar_viz = True
+            self._astar_viz_agents = {}
+            if not self._cont_mode:
+                self._run_astar_viz()
+        self._refresh_btn_state()
+
+    def _run_astar_viz(self):
+        valid = [(i, a) for i, a in enumerate(self.agents) if a.get("start") and a.get("goal")]
+        if not valid:
+            self._show("No agents with start+goal.")
+            return
+        self._astar_viz_agents = {}
+        self._astar_viz_total = 0
+        self._astar_viz = True
+
+        def worker():
+            from astar import astar
+            for idx, agent in valid:
+                self._astar_viz_agents[idx] = {}
+                cells = self._astar_viz_agents[idx]
+                def on_expand(c, r, t, total, _c=cells):
+                    _c[(c, r)] = t
+                    self._astar_viz_total = sum(len(v) for v in self._astar_viz_agents.values())
+                astar(self.grid, agent["start"], agent["goal"],
+                      time_per_cell=agent.get("tpc", 1),
+                      on_expand=on_expand)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _time_scale(self):
         return BASE_SPEED / self.grid.resolution
@@ -980,33 +1031,18 @@ class MAPFApp:
                 start = path[step]
                 safe  = self._safe_cache
 
-                offsets = self._body_offsets()
-                horizon = self._CONSTRAINT_HORIZON
-                vc = set()
-                for oi, oa in self._cont_agents.items():
-                    if oi == idx:
-                        continue
-                    op  = oa["path"]
-                    ot  = min(int(oa["local_t"]), len(op) - 1)
-                    frozen = (ot >= len(op) - 1)
-                    if frozen:
-                        # Frozen agent: treat as static obstacle for all future steps
-                        c, r = op[ot]
-                        for future_dt in range(horizon):
-                            for dc, dr in offsets:
-                                vc.add((c + dc, r + dr, future_dt + 1))
-                        continue
-                    end = min(ot + horizon, len(op))
-                    for dt, pi in enumerate(range(ot, end)):
-                        c, r = op[pi]
-                        for dc, dr in offsets:
-                            vc.add((c + dc, r + dr, dt + 1))
+                from astar import astar, _HAS_C, _astar_2d_c
+                viz_cb = None
+                if self._astar_viz:
+                    self._astar_viz_agents[idx] = {}
+                    _cells = self._astar_viz_agents[idx]
+                    def viz_cb(c, r, t, total, _c=_cells):
+                        _c[(c, r)] = t
 
-                from astar import astar
-                new_path = astar(self.grid, start, goal, vc, set(),
-                                 max_time=200, safe_positions=safe)
-                if new_path is None:
-                    new_path = astar(self.grid, start, goal, safe_positions=safe)
+                if _HAS_C and viz_cb is None:
+                    new_path = _astar_2d_c(self.grid, start, goal, safe)
+                else:
+                    new_path = astar(self.grid, start, goal, safe_positions=safe, on_expand=viz_cb)
                 if new_path is None:
                     new_path = [start]
                 results[idx] = new_path
@@ -1782,6 +1818,23 @@ class MAPFApp:
     def draw(self):
         self.screen.fill(BG)
         self._draw_grid()
+        # Top toolbar background
+        ga_w = self._grid_area_w()
+        pygame.draw.rect(self.screen, SIDEBAR_BG, (0, 0, ga_w, self.TOOLBAR_H))
+        pygame.draw.line(self.screen, SIDEBAR_EDGE, (0, self.TOOLBAR_H), (ga_w, self.TOOLBAR_H), 1)
+
+        # Toolbar group labels and separators
+        groups = [
+            (self.b_obs.rect.left, self.b_era.rect.right, "Draw", (140, 160, 200)),
+            (self.b_viz.rect.left, self.b_viz.rect.right, "View", (200, 180, 140)),
+        ]
+        for gx0, gx1, glabel, gcol in groups:
+            pygame.draw.rect(self.screen, (35, 35, 45), (gx0 - 2, 1, gx1 - gx0 + 4, self.TOOLBAR_H - 2), border_radius=4)
+            pygame.draw.rect(self.screen, (*gcol, 80), (gx0 - 2, 1, gx1 - gx0 + 4, self.TOOLBAR_H - 2), 1, border_radius=4)
+            lbl = self.font_s.render(glabel, True, gcol)
+            mid = (gx0 + gx1) // 2 - lbl.get_width() // 2
+            self.screen.blit(lbl, (mid, self.TOOLBAR_H - 12))
+        self._draw_astar_viz()
         self._draw_box_preview()
         if self._solving and self._show_progress:
             self._draw_cbs_progress()
@@ -1799,6 +1852,7 @@ class MAPFApp:
         self._draw_collision_log()
         if self.msg and self.msg_ticks > 0:
             self._draw_msg()
+        self._draw_tooltip()
         pygame.display.flip()
 
     def _draw_cont_agents(self):
@@ -1916,6 +1970,34 @@ class MAPFApp:
             col  = (255, 120, 120) if i == n - 1 else (160, 140, 140)
             txt  = self.font_s.render(entry, True, col)
             self.screen.blit(txt, (px + 6, ey))
+
+    def _draw_astar_viz(self):
+        if not self._astar_viz or not self._astar_viz_agents:
+            return
+        cell = self.cell
+        ga_w = self._grid_area_w()
+        ga_h = self.screen.get_height()
+
+        overlay = pygame.Surface((ga_w, ga_h), pygame.SRCALPHA)
+
+        for idx, cells in dict(self._astar_viz_agents).items():
+            if not cells:
+                continue
+            color = agent_color(idx)
+            for (c, r) in dict(cells):
+                x = int(c * cell + self.cam_x)
+                y = int(r * cell + self.cam_y)
+                if x + cell < 0 or y + cell < 0 or x > ga_w or y > ga_h:
+                    continue
+                overlay.fill((*color, 40), (x, y, cell, cell))
+
+        self.screen.blit(overlay, (0, 0))
+
+        total = sum(len(v) for v in self._astar_viz_agents.values())
+        txt = self.font_s.render(
+            f"A* viz: {len(self._astar_viz_agents)} agents | {total} nodes  [V=close]",
+            True, (255, 255, 100))
+        self.screen.blit(txt, (8, 4))
 
     def _draw_box_preview(self):
         if not self._drag_painting or not self._box_start or not self._box_cur:
@@ -2240,7 +2322,8 @@ class MAPFApp:
 
         total = len(self.agents)
         header = f"Agents: {total}/{MAX_AGENTS}"
-        self.screen.blit(self.font_s.render(header, True, DIM), (x0+8, ay))
+        pygame.draw.rect(self.screen, (35, 45, 55), (x0 + 4, ay - 1, SIDEBAR_W - 8, 14), border_radius=3)
+        self.screen.blit(self.font_s.render(header, True, (160, 200, 220)), (x0+8, ay))
         ay += 14
         self._agent_list_top = ay   # store for scroll hit-test
         self._agent_speed_minus = {}
@@ -2304,17 +2387,29 @@ class MAPFApp:
             pygame.draw.rect(self.screen, (50, 50, 65),  (bar_x, bar_top, 4, bar_h), border_radius=2)
             pygame.draw.rect(self.screen, (100, 100, 130), (bar_x, thumb_y, 4, thumb_h), border_radius=2)
 
-        # Section labels
-        for attr, text, col in [
-            ('_y_draw_label',     '── Draw ──',           (140, 160, 200)),
-            ('_y_agent_label',    '── Agent ──',          (140, 200, 160)),
-            ('_y_param_label',    '── Parameters ──',     (180, 180, 140)),
-            ('_y_lifelong_label', '── Lifelong MAPF ──',  (120, 180, 120)),
-            ('_y_mapf_label',     '── MAPF ──',           (180, 140, 100)),
-            ('_y_map_label',      '── Map / Data ──',     (160, 150, 180)),
+        # Section labels with background
+        for attr, text, col, bg_col in [
+            ('_y_agent_label',    ' Agent',          (180, 230, 190), (35, 50, 40)),
+            ('_y_param_label',    ' Parameters',     (220, 210, 160), (50, 45, 30)),
+            ('_y_research_label',      ' Research',       (160, 160, 200), (38, 38, 50)),
+            ('_y_realtime_label',      ' Realtime',       (200, 220, 140), (45, 50, 30)),
+            ('_y_production_label',    ' Production',     (140, 220, 180), (30, 50, 40)),
+            ('_y_map_label',           ' Map / Data',     (190, 180, 220), (40, 38, 55)),
         ]:
+            sy = getattr(self, attr)
+            pygame.draw.rect(self.screen, bg_col, (x0 + 4, sy - 1, SIDEBAR_W - 8, 14), border_radius=3)
+            pygame.draw.line(self.screen, (*col, 100), (x0 + 4, sy + 13), (x0 + SIDEBAR_W - 4, sy + 13), 1)
             lbl = self.font_s.render(text, True, col)
-            self.screen.blit(lbl, (x0 + 8, getattr(self, attr)))
+            self.screen.blit(lbl, (x0 + 8, sy))
+
+        # Tree line: CBS → RHCR
+        tree_col = (80, 100, 130)
+        lx = x0 + 8
+        if hasattr(self, 'b_auto_rhcr'):
+            pygame.draw.line(self.screen, tree_col, (lx, self.b_auto_cbs.rect.bottom),
+                             (lx, self.b_auto_rhcr.rect.centery), 1)
+            pygame.draw.line(self.screen, tree_col, (lx, self.b_auto_rhcr.rect.centery),
+                             (lx + 8, self.b_auto_rhcr.rect.centery), 1)
 
         # Slow Zone speed row
         self._draw_adj_row(x0, self._y_slow_tpc, bar_w,
@@ -2410,6 +2505,21 @@ class MAPFApp:
         bar_col = (220, 80, 80) if self._collision_agents else (140, 140, 155)
         txt = self.font_s.render("  |  ".join(parts), True, bar_col)
         self.screen.blit(txt, (6, y + 2))
+
+    def _draw_tooltip(self):
+        mx, my = pygame.mouse.get_pos()
+        for b in self._btns:
+            if b.tip and b.rect.collidepoint(mx, my):
+                txt = self.font_s.render(b.tip, True, (240, 240, 240))
+                tw, th = txt.get_size()
+                tx = min(mx, self.screen.get_width() - tw - 10)
+                ty = b.rect.bottom + 4
+                bg = pygame.Surface((tw + 8, th + 4), pygame.SRCALPHA)
+                bg.fill((20, 20, 30, 220))
+                self.screen.blit(bg, (tx - 4, ty - 2))
+                pygame.draw.rect(self.screen, (100, 100, 130), (tx - 4, ty - 2, tw + 8, th + 4), 1, border_radius=3)
+                self.screen.blit(txt, (tx, ty))
+                break
 
     def _draw_msg(self):
         txt = self.font.render(self.msg, True, (255, 255, 100))
@@ -2562,6 +2672,14 @@ class MAPFApp:
                     self._screen_w = ev.w
                     self._screen_h = ev.h
                     self._rebuild_btns()
+
+                elif ev.type == pygame.KEYDOWN:
+                    if ev.key == pygame.K_v:
+                        self._toggle_astar_viz()
+                    elif ev.key == pygame.K_TAB:
+                        self._show_progress = not self._show_progress
+                    elif ev.key == pygame.K_l:
+                        self._show_col_log = not self._show_col_log
 
             self.update(dt)
             self.draw()

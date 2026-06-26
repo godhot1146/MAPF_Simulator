@@ -1,0 +1,12 @@
+{
+  "last_map": "C:\\Users\\hprobot\\Desktop\\Github\\HELPER_Multi_Agent_Path_Finding\\maps\\10x15m.yaml",
+  "cols": 300,
+  "rows": 200,
+  "cell": 3,
+  "agent_radius": 10.0,
+  "sim_speed": 1.0,
+  "solve_timeout": 90.0,
+  "max_nodes": 9000,
+  "rhcr_window": 10,
+  "rhcr_h": 5
+}

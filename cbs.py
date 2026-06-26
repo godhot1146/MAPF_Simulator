@@ -6,32 +6,62 @@ from astar import astar
 
 # ── Obstacle clearance ─────────────────────────────────────────────────────────
 
+import numpy as np
+try:
+    from scipy.signal import fftconvolve as _fftconvolve
+    _HAS_SCIPY = True
+except ImportError:
+    _HAS_SCIPY = False
+
+
 def compute_safe_positions(grid, agent_radius):
     """
     Return the set of grid cells (c, r) where an agent of given radius
-    has no obstacle overlap.
-
-    Model: the agent is a circle of radius `agent_radius` (in cells).
-    A cell (c', r') is an obstacle if grid.is_obstacle(c', r').
-    Position (c, r) is safe iff every cell whose center is within
-    `agent_radius` of (c, r) is free.
+    has no obstacle overlap. Uses numpy convolution for speed.
     """
+
+    w, h = grid.width, grid.height
     r_ceil = int(math.ceil(agent_radius))
-    safe = set()
-    for row in range(grid.height):
-        for col in range(grid.width):
-            ok = True
-            for dr in range(-r_ceil, r_ceil + 1):
-                for dc in range(-r_ceil, r_ceil + 1):
-                    if math.sqrt(dc * dc + dr * dr) <= agent_radius:
-                        nc, nr = col + dc, row + dr
-                        if grid.is_obstacle(nc, nr) or (nc, nr) in grid.forbidden:
-                            ok = False
-                            break
-                if not ok:
-                    break
-            if ok:
-                safe.add((col, row))
+
+    # Build blocked array
+    blocked = np.zeros((h, w), dtype=np.float32)
+    for c, r in grid.obstacles:
+        if 0 <= r < h and 0 <= c < w:
+            blocked[r, c] = 1.0
+    for c, r in grid.forbidden:
+        if 0 <= r < h and 0 <= c < w:
+            blocked[r, c] = 1.0
+    # Out-of-bounds border
+    if r_ceil > 0:
+        blocked[:, :r_ceil] = 1.0
+        blocked[:, max(0, w - r_ceil):] = 1.0
+        blocked[:r_ceil, :] = 1.0
+        blocked[max(0, h - r_ceil):, :] = 1.0
+
+    # Build circular kernel
+    k_size = 2 * r_ceil + 1
+    kernel = np.zeros((k_size, k_size), dtype=np.float32)
+    for dr in range(-r_ceil, r_ceil + 1):
+        for dc in range(-r_ceil, r_ceil + 1):
+            if math.sqrt(dc * dc + dr * dr) <= agent_radius:
+                kernel[dr + r_ceil, dc + r_ceil] = 1.0
+
+    # Convolve: any overlap with blocked = unsafe
+    if _HAS_SCIPY and w * h > 10000:
+        danger = _fftconvolve(blocked, kernel, mode='same')
+    else:
+        # Fallback: manual sliding window (still fast with numpy)
+        from numpy.lib.stride_tricks import as_strided
+        pad = np.pad(blocked, r_ceil, mode='constant', constant_values=1.0)
+        danger = np.zeros((h, w), dtype=np.float32)
+        for dr in range(-r_ceil, r_ceil + 1):
+            for dc in range(-r_ceil, r_ceil + 1):
+                if math.sqrt(dc * dc + dr * dr) <= agent_radius:
+                    danger += pad[r_ceil + dr:r_ceil + dr + h, r_ceil + dc:r_ceil + dc + w]
+
+    safe_mask = danger < 0.5
+    rows, cols = np.where(safe_mask)
+    safe = set(zip(cols.tolist(), rows.tolist()))
     return safe
 
 
