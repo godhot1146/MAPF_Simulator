@@ -39,7 +39,7 @@ class ReservationTable:
                         return True
         return False
 
-    def reserve_path(self, robot_id, timed_path, t_offset=0, radius=0, time_buffer=1):
+    def reserve_path(self, robot_id, timed_path, t_offset=0, radius=0, time_buffer=0):
         """Register a timed path with spatial radius and time buffer (±time_buffer)."""
         r_ceil = int(radius + 0.5) if radius > 0 else 0
         offsets = [(0, 0)]
@@ -111,8 +111,21 @@ def insert_waits(timed_path, reservation, robot_id, agent_radius=0.5, t_offset=0
         # Check if next position is free at time t (considering radius)
         next_free = not reservation.is_reserved(c, r, t, exclude_id=robot_id, radius=agent_radius)
 
+        # Swap check: only when moving, check if another robot is moving in opposite direction
+        swap_blocked = False
+        if next_free and result and (c, r) != result[-1]:
+            prev = result[-1]
+            other_at_dest_before = reservation.table.get((c, r, t - 1))
+            other_at_prev_after = reservation.table.get((prev[0], prev[1], t))
+            if (other_at_dest_before is not None and other_at_dest_before != robot_id and
+                other_at_prev_after == other_at_dest_before):
+                swap_blocked = True
 
-        if next_free:
+        if swap_blocked:
+            # Wait 1 step and retry (don't enter wait loop)
+            result.append(result[-1] if result else timed_path[0])
+            t += 1
+        elif next_free:
             result.append((c, r))
             path_idx += 1
             t += 1

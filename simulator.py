@@ -1097,6 +1097,8 @@ class MAPFApp:
                     _df.write(f"[WORKER ERROR] {e}\n")
             finally:
                 self._astar_running = False
+                for idx in batch:
+                    self._astar_inflight.discard(idx)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2191,11 +2193,11 @@ class MAPFApp:
         else:
             t_now = int(self._global_t)
 
-        # Collect reservations: current = bright, future = dim
+        # Collect reservations: current = bright, future = dim, all shown
         cell_owners = {}  # {(c,r): (rid, closest_dt)}
         for (c, r, t), rid in dict(self._reservation.table).items():
             dt = t - t_now
-            if dt < 0 or dt > 10:
+            if dt < 0:
                 continue
             key = (c, r)
             if key not in cell_owners or dt < cell_owners[key][1]:
@@ -2207,9 +2209,11 @@ class MAPFApp:
             if x + cell < 0 or y + cell < 0 or x > ga_w or y > ga_h:
                 continue
             color = agent_color(rid)
-            alpha = max(20, 80 - dt * 6)
+            if dt == 0:
+                alpha = 100
+            else:
+                alpha = 15
             overlay.fill((*color, alpha), (x, y, cell, cell))
-            # Border for current timestep reservations
             if dt == 0:
                 pygame.draw.rect(overlay, (*color, 120), (x, y, cell, cell), 1)
 
