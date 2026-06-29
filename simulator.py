@@ -181,6 +181,7 @@ class MAPFApp:
         self._astar_running  = False # batch worker in progress
         self._astar_results  = {}    # {idx: new_path} from worker
         self._astar_inflight = set() # agent indices currently being planned
+        self._reservation    = None  # reservation table
 
         # ── Simulation log ────────────────────────────────────────────
         self._sim_log        = []    # buffered log entries
@@ -190,6 +191,7 @@ class MAPFApp:
         self._astar_viz       = False  # toggle with V key
         self._astar_viz_agents = {}    # {agent_idx: {(c,r): t}} per-agent expanded cells
         self._astar_viz_total = 0
+        self._show_reservation = False # toggle with R key
 
         self.font   = pygame.font.SysFont("consolas", 13)
         self.font_s = pygame.font.SysFont("consolas", 11)
@@ -236,6 +238,7 @@ class MAPFApp:
         self.b_speed  = B((tx, 4, 50, tb_h), "Slow",   lambda: self._set_mode(MODE_SPEED),  True, tip="감속 구역"); tx += 54
         self.b_era    = B((tx, 4, 50, tb_h), "Erase",  lambda: self._set_mode(MODE_ERASE),  True, tip="지우기"); tx += 58
         self.b_viz    = B((tx, 4, 50, tb_h), "A*Viz",  self._toggle_astar_viz, True, tip="A* 탐색 시각화 (V키)"); tx += 54
+        self.b_rviz   = B((tx, 4, 50, tb_h), "Rsrv",   lambda: setattr(self, '_show_reservation', not self._show_reservation), True, tip="예약 테이블 시각화 (R키)"); tx += 54
 
         # ── Sidebar ──────────────────────────────────────────────────
         x0 = self._grid_area_w() + 8
@@ -264,21 +267,21 @@ class MAPFApp:
 
         indent = 16
 
-        # ── Research (comparison) ────────────────────────────────────
-        self._y_research_label = y;                                                             y += 14+g
-        self.b_auto_cbs   = B((x0, y, w, h), "CBS",  lambda: self._start_auto(1), True); y += h+g
-        self.b_auto_rhcr  = B((x0+indent, y, w-indent, h), "RHCR", lambda: self._start_auto(2), True); y += h+g
+        # ── Base Algorithm (단독 테스트) ─────────────────────────────
+        # ── A* based ─────────────────────────────────────────────────
+        self._y_astar_label = y;                                                                y += 14+g
+        self.b_test_astar = B((x0, y, w, h), "A*", self._test_astar, True); y += h+g
+        self.b_auto_astar = B((x0+indent, y, w-indent, h), "CA*",   lambda: self._start_auto(0), True); y += h+g
+        self.b_auto_whca  = B((x0+indent*2, y, w-indent*2, h), "WHCA*", lambda: self._start_auto(5), True); y += h+g
+        self.b_auto_cbs   = B((x0+indent, y, w-indent, h), "CBS",  lambda: self._start_auto(1), True); y += h+g
+        self.b_auto_rhcr  = B((x0+indent*2, y, w-indent*2, h), "RHCR", lambda: self._start_auto(2), True); y += h+g
         self._y_rhcr_wh = y;                                                                        y += 18+18+g
-        self.b_auto_pbs   = B((x0, y, w, h), "PBS",  lambda: self._start_auto(3), True); y += h+g
-        self.b_solve  = B((x0, y, w, h), "SOLVE CBS", self._solve_or_cancel); y += h+g*2
+        self.b_auto_pbs   = B((x0+indent, y, w-indent, h), "PBS",   lambda: self._start_auto(3), True); y += h+g*2
 
-        # ── Realtime ─────────────────────────────────────────────────
-        self._y_realtime_label = y;                                                             y += 14+g
-        self.b_auto_pibt  = B((x0, y, w, h), "PIBT", lambda: self._start_auto(4), True); y += h+g*2
-
-        # ── Production ───────────────────────────────────────────────
-        self._y_production_label = y;                                                           y += 14+g
-        self.b_auto_astar = B((x0, y, w, h), "A* + Reservation", lambda: self._start_auto(0), True); y += h+g
+        # ── BFS based ────────────────────────────────────────────────
+        self._y_bfs_label = y;                                                                  y += 14+g
+        self.b_test_bfs   = B((x0, y, w, h), "BFS", self._test_bfs, True); y += h+g
+        self.b_auto_pibt  = B((x0+indent, y, w-indent, h), "PIBT", lambda: self._start_auto(4), True); y += h+g
 
 
         # ── Map / Data ───────────────────────────────────────────────
@@ -291,11 +294,12 @@ class MAPFApp:
 
         self._btns = [
             # Toolbar
-            self.b_obs, self.b_era, self.b_forbid, self.b_speed, self.b_viz,
+            self.b_obs, self.b_era, self.b_forbid, self.b_speed, self.b_viz, self.b_rviz,
             # Sidebar - Agent
             self.b_agnt, self.b_add, self.b_del, self.b_start, self.b_goal, self.b_rand,
-            self.b_auto_astar, self.b_auto_cbs, self.b_auto_rhcr, self.b_auto_pbs, self.b_auto_pibt,
-            self.b_solve,
+            # Base
+            self.b_test_bfs, self.b_test_astar,
+            self.b_auto_astar, self.b_auto_whca, self.b_auto_cbs, self.b_auto_rhcr, self.b_auto_pbs, self.b_auto_pibt,
             self.b_save, self.b_load,
             self.b_new, self.b_clag, self.b_call,
         ]
@@ -310,7 +314,10 @@ class MAPFApp:
         self.b_start.active    = (self.edit_sub == SUB_START)
         self.b_goal.active     = (self.edit_sub == SUB_GOAL)
         self.b_viz.active        = self._astar_viz
+        self.b_test_astar.active = self._cont_mode and self._cont_replan_mode == 6
+        self.b_test_bfs.active   = self._cont_mode and self._cont_replan_mode == 7
         self.b_auto_astar.active = self._cont_mode and self._cont_replan_mode == 0
+        self.b_auto_whca.active  = self._cont_mode and self._cont_replan_mode == 5
         self.b_auto_cbs.active   = self._cont_mode and self._cont_replan_mode == 1
         self.b_auto_rhcr.active  = self._cont_mode and self._cont_replan_mode == 2
         self.b_auto_pbs.active   = self._cont_mode and self._cont_replan_mode == 3
@@ -425,6 +432,14 @@ class MAPFApp:
             self._show(f"Log saved: {len(self._sim_log)} entries")
         except Exception:
             pass
+
+    def _test_bfs(self):
+        """Pure BFS mode: each robot finds path using BFS independently."""
+        self._start_auto(7)
+
+    def _test_astar(self):
+        """Pure A* mode: each robot finds path independently, no reservation."""
+        self._start_auto(6)
 
     def _toggle_astar_viz(self):
         if self._astar_viz:
@@ -832,6 +847,15 @@ class MAPFApp:
             self._refresh_btn_state()
 
     def _start_cont_mode(self):
+        import random, traceback
+        try:
+            self.__start_cont_mode_inner()
+        except Exception as e:
+            import sys
+            traceback.print_exc(file=sys.stdout)
+            self._show(f"Error: {e}")
+
+    def __start_cont_mode_inner(self):
         import random
         from cbs import compute_safe_positions
         from astar import astar
@@ -842,14 +866,18 @@ class MAPFApp:
             return
 
         self._show("Building safe map...")
+        pygame.display.flip()
         self._safe_cache = compute_safe_positions(self.grid, self.agent_radius)
         safe = self._safe_cache
+        print(f"[INIT] safe_positions: {len(safe)} cells, mode={self._cont_replan_mode}")
 
         self._cont_agents = {}
         self._cont_total  = 0
 
+        from reservation import ReservationTable, spatial_to_timed, insert_waits
+        reservation = ReservationTable()
+
         for idx, a in valid:
-            # Use current CBS position if available, else start
             if idx in self.paths:
                 st = min(self.sim_step, len(self.paths[idx]) - 1)
                 start = self.paths[idx][st]
@@ -857,23 +885,31 @@ class MAPFApp:
                 start = a["start"]
 
             goal = a["goal"]
-            if start not in safe:
+            if safe and start not in safe:
                 start = min(safe, key=lambda p: abs(p[0]-start[0]) + abs(p[1]-start[1]))
-            if goal not in safe:
+            if safe and goal not in safe:
                 goal = min(safe, key=lambda p: abs(p[0]-goal[0]) + abs(p[1]-goal[1]))
 
             path = astar(self.grid, start, goal, safe_positions=safe)
             if path is None:
                 path = [start]
 
+            tpc = a.get("tpc", 1)
+            timed = spatial_to_timed(path, tpc)
+            if self._cont_replan_mode in (0, 5):
+                timed = insert_waits(timed, reservation, idx)
+                reservation.reserve_path(idx, timed)
+
             self._cont_agents[idx] = {
-                "path":     path,
+                "path":     timed,
                 "local_t":  0.0,
                 "goal":     goal,
                 "arrivals": 0,
                 "tpc":      a.get("tpc", 1),
             }
 
+        self._reservation = reservation
+        print(f"[INIT] {len(self._cont_agents)} agents ready, mode={self._cont_replan_mode}")
         self._sim_log = []
         self._sim_log_t0 = time.time()
         self._log("sim_start", mode=self._cont_replan_mode,
@@ -894,9 +930,10 @@ class MAPFApp:
         self._rhcr_arrived.clear()
         self._rhcr_global_t = 0.0
         if self._cont_replan_mode == 2:
-            # Trigger first replan immediately so RHCR starts coordinated
             self._rhcr_last_t = -float(self._rhcr_h)
-            self._rhcr_first_cbs = True  # don't move until first CBS result
+            self._rhcr_first_cbs = True
+        elif self._cont_replan_mode == 5:
+            self._rhcr_last_t = 0.0
         else:
             self._rhcr_last_t = 0.0
         if self._cont_replan_mode == 4:
@@ -906,7 +943,7 @@ class MAPFApp:
             self._pibt_paths     = {}
             self._pibt_path_tick = 0
         self._reset_sim()
-        mode_names = ["A*", "CBS", "RHCR", "PBS", "PIBT"]
+        mode_names = ["CA*", "CBS", "RHCR", "PBS", "PIBT", "WHCA*", "A*", "BFS"]
         self._show(f"Auto({mode_names[self._cont_replan_mode]}): {len(self._cont_agents)} agents running.")
 
     def _pick_new_goal(self, idx):
@@ -1011,7 +1048,7 @@ class MAPFApp:
         ca["local_t"] = 0.0
 
     def _launch_astar_batch(self):
-        """Run pending A* replans in a background thread."""
+        """Run pending A* replans using reservation table."""
         if self._astar_running or not self._astar_pending:
             return
         batch = dict(self._astar_pending)
@@ -1021,17 +1058,39 @@ class MAPFApp:
 
         def worker():
             t0 = time.time()
+            from reservation import ReservationTable, spatial_to_timed, insert_waits
+            from astar import astar, _HAS_C, _astar_2d_c
+            safe = self._safe_cache
+            if self._reservation is None:
+                self._reservation = ReservationTable()
+            reservation = self._reservation
+
+            # Rebuild reservation table (only next 50 steps per robot)
+            reservation.clear()
+            RESV_HORIZON = 50
+            for oi, oa in self._cont_agents.items():
+                if oi in batch:
+                    continue
+                op = oa["path"]
+                ot = int(oa["local_t"])
+                start_idx = min(ot, len(op) - 1)
+                end_idx = min(start_idx + RESV_HORIZON, len(op))
+                remaining = op[start_idx:end_idx]
+                if remaining:
+                    reservation.reserve_path(oi, remaining, t_offset=ot)
+
             results = {}
             for idx, goal in batch.items():
                 if idx not in self._cont_agents:
                     continue
-                ca    = self._cont_agents[idx]
-                path  = ca["path"]
-                step  = min(int(ca["local_t"]), len(path) - 1)
+                ca = self._cont_agents[idx]
+                path = ca["path"]
+                step = min(int(ca["local_t"]), len(path) - 1)
                 start = path[step]
-                safe  = self._safe_cache
+                tpc = ca.get('tpc', 1)
 
-                from astar import astar, _HAS_C, _astar_2d_c
+                reservation.unreserve(idx)
+
                 viz_cb = None
                 if self._astar_viz:
                     self._astar_viz_agents[idx] = {}
@@ -1039,13 +1098,55 @@ class MAPFApp:
                     def viz_cb(c, r, t, total, _c=_cells):
                         _c[(c, r)] = t
 
-                if _HAS_C and viz_cb is None:
-                    new_path = _astar_2d_c(self.grid, start, goal, safe)
+                if self._cont_replan_mode == 7:
+                    # BFS pathfinding
+                    from collections import deque
+                    queue = deque([(start, 0)])
+                    visited = {start}
+                    came = {start: None}
+                    found = False
+                    while queue:
+                        (c, r), dist = queue.popleft()
+                        if viz_cb:
+                            viz_cb(c, r, dist, len(visited))
+                        if (c, r) == goal:
+                            found = True; break
+                        for nc, nr in self.grid.neighbors4(c, r):
+                            if (nc, nr) not in visited:
+                                if safe and (nc, nr) not in safe:
+                                    continue
+                                visited.add((nc, nr))
+                                came[(nc, nr)] = (c, r)
+                                queue.append(((nc, nr), dist + 1))
+                    if found:
+                        path = []
+                        p = goal
+                        while p is not None:
+                            path.append(p)
+                            p = came[p]
+                        path.reverse()
+                    else:
+                        path = [start]
                 else:
-                    new_path = astar(self.grid, start, goal, safe_positions=safe, on_expand=viz_cb)
-                if new_path is None:
-                    new_path = [start]
-                results[idx] = new_path
+                    if _HAS_C and viz_cb is None:
+                        path = _astar_2d_c(self.grid, start, goal, safe)
+                    else:
+                        path = astar(self.grid, start, goal, safe_positions=safe, on_expand=viz_cb)
+                if path is None:
+                    path = [start]
+
+                tpc = ca.get('tpc', 1)
+                timed = spatial_to_timed(path, tpc)
+
+                if self._cont_replan_mode in (0, 5):
+                    # CA*/WHCA*: use reservation table
+                    t_now = int(ca["local_t"])
+                    if self._cont_replan_mode == 5:
+                        timed = timed[:self._rhcr_window + 1]
+                    timed = insert_waits(timed, reservation, idx, t_offset=t_now)
+                    reservation.reserve_path(idx, timed, t_offset=t_now)
+
+                results[idx] = timed
 
             elapsed = (time.time() - t0) * 1000
             self._astar_results  = results
@@ -1749,13 +1850,29 @@ class MAPFApp:
                             ca2["pibt_stuck"] = 0
 
             else:
-                # ── A* mode: arrived OR stuck → assign new goal → replan ──────
+                # ── CA*/WHCA* mode: arrived → new goal → replan ──────────
+                is_reservation = self._cont_replan_mode in (0, 5, 6, 7)
+
+                # WHCA*: periodic full replan every H steps
+                if self._cont_replan_mode == 5:
+                    self._rhcr_global_t += dt * self.sim_speed * self._time_scale()
+                    if self._rhcr_global_t - self._rhcr_last_t >= self._rhcr_h:
+                        self._rhcr_last_t = self._rhcr_global_t
+                        # Replan all agents
+                        for idx, ca in self._cont_agents.items():
+                            if idx not in self._astar_pending and idx not in self._astar_inflight:
+                                self._astar_pending[idx] = ca["goal"]
+                        if self._astar_pending:
+                            self._launch_astar_batch()
+
                 for idx, ca in self._cont_agents.items():
                     path = ca["path"]
-                    at_goal = (int(ca["local_t"]) >= len(path) - 1
-                               and path[-1] == ca["goal"])
-                    if not at_goal:
-                        ca["local_t"] += dt * self.sim_speed * self._time_scale() / max(1, ca.get("tpc", 1))
+                    at_end = int(ca["local_t"]) >= len(path) - 1
+                    if not at_end:
+                        if is_reservation:
+                            ca["local_t"] += dt * self.sim_speed * self._time_scale()
+                        else:
+                            ca["local_t"] += dt * self.sim_speed * self._time_scale() / max(1, ca.get("tpc", 1))
 
                 for idx, ca in self._cont_agents.items():
                     if idx in self._astar_pending or idx in self._astar_inflight:
@@ -1765,7 +1882,7 @@ class MAPFApp:
                     if not at_end:
                         continue
 
-                    arrived = path[-1] == ca["goal"]
+                    arrived = (path[-1] == ca["goal"]) or (is_reservation and at_end)
                     if arrived:
                         ca["arrivals"] += 1
                         self._cont_total += 1
@@ -1826,7 +1943,7 @@ class MAPFApp:
         # Toolbar group labels and separators
         groups = [
             (self.b_obs.rect.left, self.b_era.rect.right, "Draw", (140, 160, 200)),
-            (self.b_viz.rect.left, self.b_viz.rect.right, "View", (200, 180, 140)),
+            (self.b_viz.rect.left, self.b_rviz.rect.right, "View", (200, 180, 140)),
         ]
         for gx0, gx1, glabel, gcol in groups:
             pygame.draw.rect(self.screen, (35, 35, 45), (gx0 - 2, 1, gx1 - gx0 + 4, self.TOOLBAR_H - 2), border_radius=4)
@@ -1835,6 +1952,7 @@ class MAPFApp:
             mid = (gx0 + gx1) // 2 - lbl.get_width() // 2
             self.screen.blit(lbl, (mid, self.TOOLBAR_H - 12))
         self._draw_astar_viz()
+        self._draw_reservation_viz()
         self._draw_box_preview()
         if self._solving and self._show_progress:
             self._draw_cbs_progress()
@@ -1998,6 +2116,41 @@ class MAPFApp:
             f"A* viz: {len(self._astar_viz_agents)} agents | {total} nodes  [V=close]",
             True, (255, 255, 100))
         self.screen.blit(txt, (8, 4))
+
+    def _draw_reservation_viz(self):
+        if not self._show_reservation or self._reservation is None:
+            return
+        cell = self.cell
+        ga_w = self._grid_area_w()
+        ga_h = self.screen.get_height()
+        overlay = pygame.Surface((ga_w, ga_h), pygame.SRCALPHA)
+
+        # Show reservations at current simulation time
+        t_now = 0
+        if self._cont_mode and self._cont_agents:
+            t_now = int(max(ca["local_t"] for ca in self._cont_agents.values()))
+
+        shown = set()
+        for (c, r, t), rid in dict(self._reservation.table).items():
+            if t < t_now or t > t_now + 5:
+                continue
+            if (c, r) in shown:
+                continue
+            shown.add((c, r))
+            x = int(c * cell + self.cam_x)
+            y = int(r * cell + self.cam_y)
+            if x + cell < 0 or y + cell < 0 or x > ga_w or y > ga_h:
+                continue
+            color = agent_color(rid)
+            alpha = 60 if t == t_now else 30
+            overlay.fill((*color, alpha), (x, y, cell, cell))
+
+        self.screen.blit(overlay, (0, 0))
+
+        txt = self.font_s.render(
+            f"Reservation: t={t_now} cells={len(shown)}  [R=close]",
+            True, (255, 200, 100))
+        self.screen.blit(txt, (8, self.TOOLBAR_H + 4))
 
     def _draw_box_preview(self):
         if not self._drag_painting or not self._box_start or not self._box_cur:
@@ -2391,9 +2544,8 @@ class MAPFApp:
         for attr, text, col, bg_col in [
             ('_y_agent_label',    ' Agent',          (180, 230, 190), (35, 50, 40)),
             ('_y_param_label',    ' Parameters',     (220, 210, 160), (50, 45, 30)),
-            ('_y_research_label',      ' Research',       (160, 160, 200), (38, 38, 50)),
-            ('_y_realtime_label',      ' Realtime',       (200, 220, 140), (45, 50, 30)),
-            ('_y_production_label',    ' Production',     (140, 220, 180), (30, 50, 40)),
+            ('_y_astar_label',         ' A* based',        (140, 190, 230), (30, 40, 55)),
+            ('_y_bfs_label',           ' BFS based',      (230, 200, 130), (50, 45, 30)),
             ('_y_map_label',           ' Map / Data',     (190, 180, 220), (40, 38, 55)),
         ]:
             sy = getattr(self, attr)
@@ -2402,14 +2554,34 @@ class MAPFApp:
             lbl = self.font_s.render(text, True, col)
             self.screen.blit(lbl, (x0 + 8, sy))
 
-        # Tree line: CBS → RHCR
+        # Tree lines: A* → CBS → RHCR, A* → PBS
         tree_col = (80, 100, 130)
         lx = x0 + 8
-        if hasattr(self, 'b_auto_rhcr'):
-            pygame.draw.line(self.screen, tree_col, (lx, self.b_auto_cbs.rect.bottom),
-                             (lx, self.b_auto_rhcr.rect.centery), 1)
-            pygame.draw.line(self.screen, tree_col, (lx, self.b_auto_rhcr.rect.centery),
-                             (lx + 8, self.b_auto_rhcr.rect.centery), 1)
+        # CA* → WHCA* branch
+        pygame.draw.line(self.screen, tree_col, (lx, self.b_auto_astar.rect.bottom),
+                         (lx, self.b_auto_whca.rect.centery), 1)
+        pygame.draw.line(self.screen, tree_col, (lx, self.b_auto_whca.rect.centery),
+                         (lx + 16, self.b_auto_whca.rect.centery), 1)
+        # CBS branch
+        pygame.draw.line(self.screen, tree_col, (lx, self.b_auto_astar.rect.bottom),
+                         (lx, self.b_auto_cbs.rect.centery), 1)
+        pygame.draw.line(self.screen, tree_col, (lx, self.b_auto_cbs.rect.centery),
+                         (lx + 8, self.b_auto_cbs.rect.centery), 1)
+        # RHCR branch
+        pygame.draw.line(self.screen, tree_col, (lx, self.b_auto_cbs.rect.bottom),
+                         (lx, self.b_auto_rhcr.rect.centery), 1)
+        pygame.draw.line(self.screen, tree_col, (lx, self.b_auto_rhcr.rect.centery),
+                         (lx + 16, self.b_auto_rhcr.rect.centery), 1)
+        # PBS branch
+        pygame.draw.line(self.screen, tree_col, (lx, self.b_auto_astar.rect.bottom),
+                         (lx, self.b_auto_pbs.rect.centery), 1)
+        pygame.draw.line(self.screen, tree_col, (lx, self.b_auto_pbs.rect.centery),
+                         (lx + 8, self.b_auto_pbs.rect.centery), 1)
+        # BFS → PIBT
+        pygame.draw.line(self.screen, tree_col, (lx, self.b_test_bfs.rect.bottom),
+                         (lx, self.b_auto_pibt.rect.centery), 1)
+        pygame.draw.line(self.screen, tree_col, (lx, self.b_auto_pibt.rect.centery),
+                         (lx + 8, self.b_auto_pibt.rect.centery), 1)
 
         # Slow Zone speed row
         self._draw_adj_row(x0, self._y_slow_tpc, bar_w,
@@ -2417,8 +2589,6 @@ class MAPFApp:
                            '_rect_zone_tpc_minus', '_rect_zone_tpc_plus')
 
         # SOLVE 버튼 라벨 동적 변경
-        self.b_solve.label = "CANCEL" if self._solving else "SOLVE CBS"
-        self.b_solve.active = self._solving
 
         # Status bar
         if self._solving:
@@ -2442,7 +2612,7 @@ class MAPFApp:
                 status = f"Auto CBS: computing...  nodes:{nodes} open:{opens}"
                 col    = (100, 220, 100)
             else:
-                mode_s = ["A*", "CBS", "RHCR", "PBS", "PIBT"][self._cont_replan_mode]
+                mode_s = ["CA*", "CBS", "RHCR", "PBS", "PIBT", "WHCA*", "A*", "BFS"][self._cont_replan_mode]
                 status = f"Auto({mode_s}): {self._cont_total} arrivals  ({len(self._cont_agents)} agents)"
                 col    = (100, 220, 180)
         elif self.sim_run:
@@ -2676,6 +2846,8 @@ class MAPFApp:
                 elif ev.type == pygame.KEYDOWN:
                     if ev.key == pygame.K_v:
                         self._toggle_astar_viz()
+                    elif ev.key == pygame.K_r:
+                        self._show_reservation = not self._show_reservation
                     elif ev.key == pygame.K_TAB:
                         self._show_progress = not self._show_progress
                     elif ev.key == pygame.K_l:
