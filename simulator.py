@@ -182,6 +182,7 @@ class MAPFApp:
         self._astar_results  = {}    # {idx: new_path} from worker
         self._astar_inflight = set() # agent indices currently being planned
         self._reservation    = None  # reservation table
+        self._global_t       = 0.0  # global clock for reservation sync
 
         # ── Simulation log ────────────────────────────────────────────
         self._sim_log        = []    # buffered log entries
@@ -192,6 +193,10 @@ class MAPFApp:
         self._astar_viz_agents = {}    # {agent_idx: {(c,r): t}} per-agent expanded cells
         self._astar_viz_total = 0
         self._show_reservation = False # toggle with R key
+        self._resv_view_t     = -1    # -1 = auto (follow global_t), >=0 = manual
+        self._show_perf       = False # toggle with P key
+        self._perf_data       = {}    # cached perf data
+        self._perf_update_t   = 0.0   # last update time
 
         self.font   = pygame.font.SysFont("consolas", 13)
         self.font_s = pygame.font.SysFont("consolas", 11)
@@ -239,6 +244,7 @@ class MAPFApp:
         self.b_era    = B((tx, 4, 50, tb_h), "Erase",  lambda: self._set_mode(MODE_ERASE),  True, tip="지우기"); tx += 58
         self.b_viz    = B((tx, 4, 50, tb_h), "A*Viz",  self._toggle_astar_viz, True, tip="A* 탐색 시각화 (V키)"); tx += 54
         self.b_rviz   = B((tx, 4, 50, tb_h), "Rsrv",   lambda: setattr(self, '_show_reservation', not self._show_reservation), True, tip="예약 테이블 시각화 (R키)"); tx += 54
+        self.b_perf   = B((tx, 4, 50, tb_h), "Perf",   lambda: setattr(self, '_show_perf', not self._show_perf), True, tip="시스템 성능 모니터 (P키)"); tx += 54
 
         # ── Sidebar ──────────────────────────────────────────────────
         x0 = self._grid_area_w() + 8
@@ -294,7 +300,7 @@ class MAPFApp:
 
         self._btns = [
             # Toolbar
-            self.b_obs, self.b_era, self.b_forbid, self.b_speed, self.b_viz, self.b_rviz,
+            self.b_obs, self.b_era, self.b_forbid, self.b_speed, self.b_viz, self.b_rviz, self.b_perf,
             # Sidebar - Agent
             self.b_agnt, self.b_add, self.b_del, self.b_start, self.b_goal, self.b_rand,
             # Base
@@ -387,6 +393,8 @@ class MAPFApp:
                         self._collision_count += 1
                         self._log("collision", a1=i, a2=j, dist=round(dist, 3),
                                   count=self._collision_count)
+                        with open("debug.log", "a") as _df:
+                            _df.write(f"[COLLISION] A{i+1}<->A{j+1} dist={dist:.3f} t={time.time():.1f}\n")
                         ts = f"{time.time():.1f}"
                         entry = f"#{self._collision_count:3d}  A{i+1} <-> A{j+1}"
                         self._collision_log.append(entry)
@@ -411,13 +419,18 @@ class MAPFApp:
         entry = {"t": round(elapsed, 3), "event": event}
         entry.update(data)
         self._sim_log.append(entry)
+        try:
+            with open("debug.log", "a") as _df:
+                _df.write(f"[SIM] t={elapsed:.1f} {event} {data}\n")
+        except Exception:
+            pass
 
     def _flush_log(self):
         if not self._sim_log:
             return
         import json
         log_path = os.path.join(os.path.dirname(__file__), "sim_log.json")
-        mode_names = {0: "A*", 1: "CBS", 2: "RHCR", 3: "PBS", 4: "PIBT"}
+        mode_names = {0: "CA*", 1: "CBS", 2: "RHCR", 3: "PBS", 4: "PIBT", 5: "WHCA*", 6: "A*", 7: "BFS"}
         header = {
             "mode": mode_names.get(self._cont_replan_mode, "manual"),
             "map_size": f"{self.grid.width}x{self.grid.height}",
@@ -426,12 +439,7 @@ class MAPFApp:
             "agent_count": len(self._cont_agents) if self._cont_agents else len(self.agents),
             "total_entries": len(self._sim_log),
         }
-        try:
-            with open(log_path, "w", encoding="utf-8") as f:
-                json.dump({"info": header, "log": self._sim_log}, f, indent=1)
-            self._show(f"Log saved: {len(self._sim_log)} entries")
-        except Exception:
-            pass
+        self._show(f"Log saved: {len(self._sim_log)} entries")
 
     def _test_bfs(self):
         """Pure BFS mode: each robot finds path using BFS independently."""
@@ -525,7 +533,12 @@ class MAPFApp:
         if len(self.agents) >= MAX_AGENTS:
             self._show(f"Max {MAX_AGENTS} agents.")
             return
-        self.agents.append({"start": None, "goal": None, "tpc": 1})
+        import random as _rnd
+        existing_prios = {a.get("priority", 0) for a in self.agents}
+        prio = 1
+        while prio in existing_prios:
+            prio += 1
+        self.agents.append({"start": None, "goal": None, "tpc": 1, "priority": prio})
         self.sel      = len(self.agents) - 1
         self.mode     = MODE_AGNT
         self.edit_sub = SUB_START
@@ -821,6 +834,10 @@ class MAPFApp:
         self._cont_cbs_pend = False
         self._cont_cbs_res  = None
         self._cont_progress = {}
+        self._astar_running = False
+        self._astar_pending = {}
+        self._astar_inflight = set()
+        self._astar_results = {}
         self._rhcr_global_t = 0.0
         self._rhcr_last_t   = 0.0
         self._rhcr_arrived.clear()
@@ -869,7 +886,8 @@ class MAPFApp:
         pygame.display.flip()
         self._safe_cache = compute_safe_positions(self.grid, self.agent_radius)
         safe = self._safe_cache
-        print(f"[INIT] safe_positions: {len(safe)} cells, mode={self._cont_replan_mode}")
+        with open("debug.log", "w") as _df:
+            _df.write(f"[INIT] safe={len(safe)} mode={self._cont_replan_mode}\n")
 
         self._cont_agents = {}
         self._cont_total  = 0
@@ -895,21 +913,33 @@ class MAPFApp:
                 path = [start]
 
             tpc = a.get("tpc", 1)
+            with open("debug.log", "a") as _df:
+                _df.write(f"[PLAN] A{idx+1} path={len(path)} start={start} goal={goal} table={len(reservation.table)}\n")
             timed = spatial_to_timed(path, tpc)
             if self._cont_replan_mode in (0, 5):
-                timed = insert_waits(timed, reservation, idx)
-                reservation.reserve_path(idx, timed)
+                with open("debug.log", "a") as _df:
+                    _df.write(f"[PLAN] A{idx+1} insert_waits start timed={len(timed)}\n")
+                timed = insert_waits(timed, reservation, idx, agent_radius=self.agent_radius)
+                with open("debug.log", "a") as _df:
+                    _df.write(f"[PLAN] A{idx+1} done timed={len(timed)} table={len(reservation.table)}\n")
+                reservation.reserve_path(idx, timed, radius=self.agent_radius)
+                with open("debug.log", "a") as _df:
+                    _df.write(f"[PLAN] A{idx+1} reserved table={len(reservation.table)}\n")
 
             self._cont_agents[idx] = {
                 "path":     timed,
                 "local_t":  0.0,
+                "t_start":  0.0,
                 "goal":     goal,
                 "arrivals": 0,
                 "tpc":      a.get("tpc", 1),
+                "priority": a.get("priority", idx + 1),
             }
 
         self._reservation = reservation
-        print(f"[INIT] {len(self._cont_agents)} agents ready, mode={self._cont_replan_mode}")
+        self._global_t = 0.0
+        with open("debug.log", "a") as _df:
+            _df.write(f"[INIT] {len(self._cont_agents)} agents ready mode={self._cont_replan_mode}\n")
         self._sim_log = []
         self._sim_log_t0 = time.time()
         self._log("sim_start", mode=self._cont_replan_mode,
@@ -1046,6 +1076,7 @@ class MAPFApp:
 
         ca["path"]    = new_path
         ca["local_t"] = 0.0
+        ca["t_start"] = self._global_t
 
     def _launch_astar_batch(self):
         """Run pending A* replans using reservation table."""
@@ -1057,6 +1088,19 @@ class MAPFApp:
         self._astar_running = True
 
         def worker():
+            try:
+                self._worker_inner(batch)
+            except Exception as e:
+                import traceback
+                with open("debug.log", "a") as _df:
+                    traceback.print_exc(file=_df)
+                    _df.write(f"[WORKER ERROR] {e}\n")
+            finally:
+                self._astar_running = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _worker_inner(self, batch):
             t0 = time.time()
             from reservation import ReservationTable, spatial_to_timed, insert_waits
             from astar import astar, _HAS_C, _astar_2d_c
@@ -1065,22 +1109,18 @@ class MAPFApp:
                 self._reservation = ReservationTable()
             reservation = self._reservation
 
-            # Rebuild reservation table (only next 50 steps per robot)
-            reservation.clear()
-            RESV_HORIZON = 50
-            for oi, oa in self._cont_agents.items():
-                if oi in batch:
-                    continue
-                op = oa["path"]
-                ot = int(oa["local_t"])
-                start_idx = min(ot, len(op) - 1)
-                end_idx = min(start_idx + RESV_HORIZON, len(op))
-                remaining = op[start_idx:end_idx]
-                if remaining:
-                    reservation.reserve_path(oi, remaining, t_offset=ot)
+            # Remove only batch robots' reservations (keep others intact)
+            for idx in batch:
+                reservation.unreserve(idx)
+            # Clean old entries
+            reservation.clear_before(int(self._global_t) - 5)
 
+            # Priority: agent priority (lower number = higher priority)
+            sorted_batch = sorted(batch.items(),
+                                  key=lambda x: self._cont_agents.get(x[0], {}).get("priority",
+                                                self.agents[x[0]].get("priority", 99) if x[0] < len(self.agents) else 99))
             results = {}
-            for idx, goal in batch.items():
+            for idx, goal in sorted_batch:
                 if idx not in self._cont_agents:
                     continue
                 ca = self._cont_agents[idx]
@@ -1136,15 +1176,21 @@ class MAPFApp:
                     path = [start]
 
                 tpc = ca.get('tpc', 1)
+                with open("debug.log", "a") as _df:
+                    _df.write(f"[WORKER] A{idx+1} path={len(path)} start={start} goal={goal} table={len(reservation.table)}\n")
                 timed = spatial_to_timed(path, tpc)
 
                 if self._cont_replan_mode in (0, 5):
                     # CA*/WHCA*: use reservation table
-                    t_now = int(ca["local_t"])
+                    t_now = int(self._global_t)
                     if self._cont_replan_mode == 5:
                         timed = timed[:self._rhcr_window + 1]
-                    timed = insert_waits(timed, reservation, idx, t_offset=t_now)
-                    reservation.reserve_path(idx, timed, t_offset=t_now)
+                    with open("debug.log", "a") as _df:
+                        _df.write(f"[WORKER] A{idx+1} insert_waits start timed={len(timed)} t_now={t_now}\n")
+                    timed = insert_waits(timed, reservation, idx, agent_radius=self.agent_radius, t_offset=t_now)
+                    with open("debug.log", "a") as _df:
+                        _df.write(f"[WORKER] A{idx+1} insert_waits done timed={len(timed)}\n")
+                    reservation.reserve_path(idx, timed, t_offset=t_now, radius=self.agent_radius)
 
                 results[idx] = timed
 
@@ -1152,9 +1198,6 @@ class MAPFApp:
             self._astar_results  = results
             self._stat_replan_ms  = elapsed
             self._stat_replan_cnt += len(results)
-            self._astar_running   = False
-
-        threading.Thread(target=worker, daemon=True).start()
 
     def _launch_pbs_batch(self):
         """PBS per-arrival: replan each pending agent using ALL other agents'
@@ -1429,6 +1472,11 @@ class MAPFApp:
         starts, goals = chosen[:n], chosen[n:]
 
         added = 0
+        # Generate unique random priorities
+        existing_prios = {a.get("priority", 0) for a in self.agents}
+        prio_pool = [p for p in range(1, MAX_AGENTS + 1) if p not in existing_prios]
+        random.shuffle(prio_pool)
+
         for i in range(n):
             if len(self.agents) >= MAX_AGENTS:
                 break
@@ -1437,7 +1485,8 @@ class MAPFApp:
             else:
                 rand_ms = random.uniform(0.01, 2.0)
                 spd_tpc = max(1, round(BASE_SPEED / rand_ms))
-            self.agents.append({"start": starts[i], "goal": goals[i], "tpc": spd_tpc})
+            prio = prio_pool[i] if i < len(prio_pool) else i + 1
+            self.agents.append({"start": starts[i], "goal": goals[i], "tpc": spd_tpc, "priority": prio})
             added += 1
 
         self.sel = max(0, len(self.agents) - 1)
@@ -1603,6 +1652,7 @@ class MAPFApp:
                     if idx in self._cont_agents:
                         self._cont_agents[idx]["path"]    = new_path
                         self._cont_agents[idx]["local_t"] = 0.0
+                        self._cont_agents[idx]["t_start"] = self._global_t
                         self._cont_agents[idx]["goal"]    = new_path[-1]
                         self._log("replan_astar", agent=idx, path_len=len(new_path),
                                   goal=list(new_path[-1]))
@@ -1865,6 +1915,9 @@ class MAPFApp:
                         if self._astar_pending:
                             self._launch_astar_batch()
 
+                if is_reservation:
+                    self._global_t += dt * self.sim_speed * self._time_scale()
+
                 for idx, ca in self._cont_agents.items():
                     path = ca["path"]
                     at_end = int(ca["local_t"]) >= len(path) - 1
@@ -1905,15 +1958,17 @@ class MAPFApp:
                     ]
                     if not cands:
                         cands = [p for p in safe if p != cur]
-                    if cands:
-                        ca["goal"] = random.choice(cands)
-                    else:
-                        continue
+                    if not cands:
+                        cands = list(safe) if safe else [(cur[0]+1, cur[1])]
+                    ca["goal"] = random.choice(cands)
 
                     self._log("new_goal", agent=idx, goal=list(ca["goal"]))
                     self._astar_pending[idx] = ca["goal"]
+                    with open("debug.log", "a") as _df:
+                        _df.write(f"[GOAL] A{idx+1} goal={ca['goal']} pending={len(self._astar_pending)} running={self._astar_running} inflight={len(self._astar_inflight)}\n")
 
-                self._launch_astar_batch()
+                if self._astar_pending:
+                    self._launch_astar_batch()
 
         if self.msg_ticks > 0:
             self.msg_ticks -= 1
@@ -1943,7 +1998,7 @@ class MAPFApp:
         # Toolbar group labels and separators
         groups = [
             (self.b_obs.rect.left, self.b_era.rect.right, "Draw", (140, 160, 200)),
-            (self.b_viz.rect.left, self.b_rviz.rect.right, "View", (200, 180, 140)),
+            (self.b_viz.rect.left, self.b_perf.rect.right, "View", (200, 180, 140)),
         ]
         for gx0, gx1, glabel, gcol in groups:
             pygame.draw.rect(self.screen, (35, 35, 45), (gx0 - 2, 1, gx1 - gx0 + 4, self.TOOLBAR_H - 2), border_radius=4)
@@ -1970,6 +2025,7 @@ class MAPFApp:
         self._draw_collision_log()
         if self.msg and self.msg_ticks > 0:
             self._draw_msg()
+        self._draw_perf_monitor()
         self._draw_tooltip()
         pygame.display.flip()
 
@@ -2051,6 +2107,11 @@ class MAPFApp:
             pygame.draw.circle(self.screen, (255, 255, 255), (int(sx), int(sy)), radius, 1)
             if idx in self._collision_agents:
                 pygame.draw.circle(self.screen, (255, 50, 50), (int(sx), int(sy)), radius + 3, 2)
+            # Priority label above robot
+            prio = ca.get("priority", "")
+            if prio and cell >= 6:
+                plbl = self.font_s.render(f"P{prio}", True, (255, 255, 255))
+                self.screen.blit(plbl, (int(sx) - plbl.get_width() // 2, int(sy) - radius - 12))
 
     def _draw_collision_log(self):
         if not self._show_col_log:
@@ -2125,30 +2186,38 @@ class MAPFApp:
         ga_h = self.screen.get_height()
         overlay = pygame.Surface((ga_w, ga_h), pygame.SRCALPHA)
 
-        # Show reservations at current simulation time
-        t_now = 0
-        if self._cont_mode and self._cont_agents:
-            t_now = int(max(ca["local_t"] for ca in self._cont_agents.values()))
+        if self._resv_view_t >= 0:
+            t_now = self._resv_view_t
+        else:
+            t_now = int(self._global_t)
 
-        shown = set()
+        # Collect reservations: current = bright, future = dim
+        cell_owners = {}  # {(c,r): (rid, closest_dt)}
         for (c, r, t), rid in dict(self._reservation.table).items():
-            if t < t_now or t > t_now + 5:
+            dt = t - t_now
+            if dt < 0 or dt > 10:
                 continue
-            if (c, r) in shown:
-                continue
-            shown.add((c, r))
+            key = (c, r)
+            if key not in cell_owners or dt < cell_owners[key][1]:
+                cell_owners[key] = (rid, dt)
+
+        for (c, r), (rid, dt) in cell_owners.items():
             x = int(c * cell + self.cam_x)
             y = int(r * cell + self.cam_y)
             if x + cell < 0 or y + cell < 0 or x > ga_w or y > ga_h:
                 continue
             color = agent_color(rid)
-            alpha = 60 if t == t_now else 30
+            alpha = max(20, 80 - dt * 6)
             overlay.fill((*color, alpha), (x, y, cell, cell))
+            # Border for current timestep reservations
+            if dt == 0:
+                pygame.draw.rect(overlay, (*color, 120), (x, y, cell, cell), 1)
 
         self.screen.blit(overlay, (0, 0))
 
+        mode_str = "auto" if self._resv_view_t < 0 else "manual"
         txt = self.font_s.render(
-            f"Reservation: t={t_now} cells={len(shown)}  [R=close]",
+            f"Reservation: t={t_now} ({mode_str}) cells={len(cell_owners)} table={len(self._reservation.table)}  [R=close ↑↓=time SPACE=auto]",
             True, (255, 200, 100))
         self.screen.blit(txt, (8, self.TOOLBAR_H + 4))
 
@@ -2664,6 +2733,7 @@ class MAPFApp:
                 status = "A* running..." if self._astar_running else f"last A*:{self._stat_replan_ms:.0f}ms"
                 parts.append(status)
                 parts.append(f"replan:{self._stat_replan_ps:.1f}/s")
+            parts.append(f"t={self._global_t:.1f}")
             parts.append(f"arrivals:{self._cont_total}")
             parts.append(f"throughput:{self._throughput:.0f} tasks/min")
 
@@ -2675,6 +2745,66 @@ class MAPFApp:
         bar_col = (220, 80, 80) if self._collision_agents else (140, 140, 155)
         txt = self.font_s.render("  |  ".join(parts), True, bar_col)
         self.screen.blit(txt, (6, y + 2))
+
+    def _perf_collect_worker(self):
+        import psutil
+        proc = psutil.Process()
+        while self._perf_thread_running:
+            d = {
+                "cpu": psutil.cpu_percent(),
+                "ram_used": psutil.virtual_memory().used / (1024**3),
+                "ram_total": psutil.virtual_memory().total / (1024**3),
+                "ram_pct": psutil.virtual_memory().percent,
+                "proc_cpu": proc.cpu_percent(),
+                "proc_ram": proc.memory_info().rss / (1024**2),
+            }
+            try:
+                import GPUtil
+                gpus = GPUtil.getGPUs()
+                if gpus:
+                    g = gpus[0]
+                    d["gpu"] = g.load * 100
+                    d["gpu_mem"] = g.memoryUsed
+                    d["gpu_mem_total"] = g.memoryTotal
+            except Exception:
+                pass
+            self._perf_data = d
+            time.sleep(2)
+
+    def _draw_perf_monitor(self):
+        if not self._show_perf:
+            return
+        if not self._perf_data:
+            if not getattr(self, '_perf_thread_running', False):
+                self._perf_thread_running = True
+                threading.Thread(target=self._perf_collect_worker, daemon=True).start()
+
+        d = self._perf_data
+        if not d:
+            return
+
+        lines = [
+            f"CPU: {d.get('cpu', 0):.0f}%  (sim: {d.get('proc_cpu', 0):.0f}%)",
+            f"RAM: {d.get('ram_used', 0):.1f}/{d.get('ram_total', 0):.1f}GB ({d.get('ram_pct', 0):.0f}%)  sim: {d.get('proc_ram', 0):.0f}MB",
+        ]
+        if "gpu" in d:
+            lines.append(f"GPU: {d['gpu']:.0f}%  VRAM: {d['gpu_mem']:.0f}/{d['gpu_mem_total']:.0f}MB")
+
+        ga_w = self._grid_area_w()
+        panel_w = 320
+        panel_h = 14 * len(lines) + 8
+        px = ga_w - panel_w - 8
+        py = self.TOOLBAR_H + 4
+
+        bg = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
+        bg.fill((15, 15, 20, 200))
+        self.screen.blit(bg, (px, py))
+        pygame.draw.rect(self.screen, (80, 100, 80), (px, py, panel_w, panel_h), 1, border_radius=3)
+
+        for i, line in enumerate(lines):
+            col = (180, 255, 180) if "sim" in line else (200, 200, 200)
+            txt = self.font_s.render(line, True, col)
+            self.screen.blit(txt, (px + 6, py + 4 + i * 14))
 
     def _draw_tooltip(self):
         mx, my = pygame.mouse.get_pos()
@@ -2846,8 +2976,26 @@ class MAPFApp:
                 elif ev.type == pygame.KEYDOWN:
                     if ev.key == pygame.K_v:
                         self._toggle_astar_viz()
+                    elif ev.key == pygame.K_p:
+                        self._show_perf = not self._show_perf
+                        self._perf_thread_running = False
+                        if self._show_perf:
+                            self._perf_data = {}
+                            self._perf_thread_running = True
+                            threading.Thread(target=self._perf_collect_worker, daemon=True).start()
                     elif ev.key == pygame.K_r:
                         self._show_reservation = not self._show_reservation
+                        self._resv_view_t = -1
+                    elif ev.key == pygame.K_UP and self._show_reservation:
+                        if self._resv_view_t < 0:
+                            self._resv_view_t = int(self._global_t)
+                        self._resv_view_t += 1
+                    elif ev.key == pygame.K_DOWN and self._show_reservation:
+                        if self._resv_view_t < 0:
+                            self._resv_view_t = int(self._global_t)
+                        self._resv_view_t = max(0, self._resv_view_t - 1)
+                    elif ev.key == pygame.K_SPACE and self._show_reservation:
+                        self._resv_view_t = -1
                     elif ev.key == pygame.K_TAB:
                         self._show_progress = not self._show_progress
                     elif ev.key == pygame.K_l:

@@ -22,21 +22,48 @@ class ReservationTable:
         for k in to_remove:
             del self.table[k]
 
-    def is_reserved(self, c, r, t, exclude_id=None):
-        owner = self.table.get((c, r, t))
-        if owner is None:
+    def is_reserved(self, c, r, t, exclude_id=None, radius=0):
+        """Check if (c,r) at time t conflicts with any reservation within radius."""
+        r_ceil = int(radius + 0.5) if radius > 0 else 0
+        if r_ceil == 0:
+            owner = self.table.get((c, r, t))
+            if owner is not None and owner != exclude_id:
+                return True
             return False
-        return owner != exclude_id
+        import math
+        for dc in range(-r_ceil, r_ceil + 1):
+            for dr in range(-r_ceil, r_ceil + 1):
+                if math.sqrt(dc * dc + dr * dr) <= radius:
+                    owner = self.table.get((c + dc, r + dr, t))
+                    if owner is not None and owner != exclude_id:
+                        return True
+        return False
 
-    def reserve_path(self, robot_id, timed_path, t_offset=0):
-        """Register a timed path starting at t_offset."""
+    def reserve_path(self, robot_id, timed_path, t_offset=0, radius=0, time_buffer=1):
+        """Register a timed path with spatial radius and time buffer (±time_buffer)."""
+        r_ceil = int(radius + 0.5) if radius > 0 else 0
+        offsets = [(0, 0)]
+        if r_ceil > 0:
+            import math
+            offsets = [(dc, dr)
+                       for dc in range(-r_ceil, r_ceil + 1)
+                       for dr in range(-r_ceil, r_ceil + 1)
+                       if math.sqrt(dc * dc + dr * dr) <= radius]
+
         for i, (c, r) in enumerate(timed_path):
-            self.table[(c, r, t_offset + i)] = robot_id
+            base_t = t_offset + i
+            for dt in range(-time_buffer, time_buffer + 1):
+                t = base_t + dt
+                if t < 0:
+                    continue
+                for dc, dr in offsets:
+                    self.table[(c + dc, r + dr, t)] = robot_id
         if timed_path:
             last_c, last_r = timed_path[-1]
             end_t = t_offset + len(timed_path)
             for extra_t in range(end_t, end_t + 10):
-                self.table[(last_c, last_r, extra_t)] = robot_id
+                for dc, dr in offsets:
+                    self.table[(last_c + dc, last_r + dr, extra_t)] = robot_id
             self.max_t = max(self.max_t, end_t + 10)
 
     def unreserve(self, robot_id):
@@ -70,44 +97,48 @@ def insert_waits(timed_path, reservation, robot_id, agent_radius=0.5, t_offset=0
     result = []
     t = t_offset
     path_idx = 0
-    max_waits = 30
+    max_waits = 999999
 
     start_c, start_r = timed_path[0]
 
+    total_iters = 0
+    _debug_count = 0
+
     while path_idx < len(timed_path):
+
         c, r = timed_path[path_idx]
 
-        # Check if next position is free at time t
-        next_free = not reservation.is_reserved(c, r, t, exclude_id=robot_id)
+        # Check if next position is free at time t (considering radius)
+        next_free = not reservation.is_reserved(c, r, t, exclude_id=robot_id, radius=agent_radius)
 
-        # Also check edge conflict (swap): if we move A->B and someone else moves B->A
-        if next_free and path_idx > 0 and result:
-            prev_c, prev_r = result[-1]
-            if reservation.is_reserved(prev_c, prev_r, t, exclude_id=robot_id):
-                # Someone is moving into our previous cell — possible swap
-                next_free = False
 
         if next_free:
             result.append((c, r))
             path_idx += 1
             t += 1
         else:
-            # Wait at current position (or start position)
             if result:
                 wait_pos = result[-1]
             else:
                 wait_pos = timed_path[0]
 
-            # Make sure wait position itself is not reserved
+            blocker = reservation.table.get((c, r, t))
+            _debug_count += 1
+            if _debug_count <= 5 or _debug_count % 100 == 0:
+                with open("debug.log", "a") as _df:
+                    _df.write(f"  [WAIT] robot={robot_id} step={path_idx}/{len(timed_path)} pos=({c},{r}) t={t} blocker={blocker} waits={len(result)}\n")
+
             wait_count = 0
             while wait_count < max_waits:
-                if not reservation.is_reserved(c, r, t, exclude_id=robot_id):
+                if not reservation.is_reserved(c, r, t, exclude_id=robot_id, radius=agent_radius):
                     break
                 result.append(wait_pos)
                 t += 1
                 wait_count += 1
 
             if wait_count >= max_waits:
+                with open("debug.log", "a") as _df:
+                    _df.write(f"  [MAX_WAIT] robot={robot_id} step={path_idx} pos=({c},{r}) t={t} blocker_now={reservation.table.get((c,r,t))}\n")
                 result.append((c, r))
                 path_idx += 1
                 t += 1
